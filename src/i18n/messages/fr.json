@@ -2630,6 +2630,8 @@
         "tokenCacheRead": "Lecture du cache",
         "tokenCacheWrite": "Écriture du cache",
         "duration": "Durée",
+        "workedFor": "A travaillé pendant {duration}",
+        "working": "Travail en cours…",
         "completedAt": "Terminé à",
         "jumpToPreviousUserMessage": "Aller au message utilisateur",
         "showMore": "Afficher plus",

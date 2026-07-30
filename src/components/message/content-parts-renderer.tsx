@@ -5,7 +5,7 @@ import {
   TOOL_KIND_ORDER,
   type ToolKindLabel,
 } from "@/lib/adapters/tool-kind-classifier"
-import type { MessageRole, PlanEntryInfo } from "@/lib/types"
+import type { AgentType, MessageRole, PlanEntryInfo } from "@/lib/types"
 import {
   extractClaudeCodeMetaTitle,
   normalizeToolName,
@@ -21,6 +21,7 @@ import {
 } from "@/lib/line-change-stats"
 import { MessageResponse } from "@/components/ai-elements/message"
 import { Shimmer } from "@/components/ai-elements/shimmer"
+import { formatElapsedLabel } from "@/lib/format-elapsed"
 import {
   Collapsible,
   CollapsibleContent,
@@ -2621,8 +2622,10 @@ const ProposedPlanPart = memo(function ProposedPlanPart({
 
 const ToolGroupPart = memo(function ToolGroupPart({
   part,
+  compact = false,
 }: {
   part: Extract<AdaptedContentPart, { type: "tool-group" }>
+  compact?: boolean
 }) {
   const t = useTranslations("Folder.chat.contentParts.toolGroup")
   const [open, setOpen] = useState(false)
@@ -2664,7 +2667,10 @@ const ToolGroupPart = memo(function ToolGroupPart({
     <Collapsible open={open} onOpenChange={setOpen} className="w-full">
       <CollapsibleTrigger
         className={cn(
-          "group inline-flex max-w-full items-center gap-1.5 rounded-full bg-muted/60 px-3.5 py-2 text-xs font-medium text-muted-foreground transition-colors hover:bg-muted hover:text-foreground ws-msg-chip"
+          "group inline-flex max-w-full items-center gap-1.5 text-muted-foreground transition-colors hover:text-foreground",
+          compact
+            ? "py-0.5 text-sm font-normal"
+            : "rounded-full bg-muted/60 px-3.5 py-2 text-xs font-medium ws-msg-chip"
         )}
       >
         <ChevronRightIcon
@@ -2698,7 +2704,12 @@ const ToolGroupPart = memo(function ToolGroupPart({
           "data-[state=closed]:slide-out-to-top-1 data-[state=open]:slide-in-from-top-1"
         )}
       >
-        <div className="mt-3 w-full space-y-3">
+        <div
+          className={cn(
+            "w-full",
+            compact ? "mt-2 space-y-2" : "mt-3 space-y-3"
+          )}
+        >
           {part.items.map((item, idx) => (
             <ToolCallPart
               key={`grouped-tc-${item.toolCallId ?? idx}-${idx}`}
@@ -2711,17 +2722,116 @@ const ToolGroupPart = memo(function ToolGroupPart({
   )
 })
 
+export interface CodexActivityParts {
+  activity: AdaptedContentPart[]
+  answer: AdaptedContentPart[]
+}
+
+/**
+ * Codex persists many short reasoning summaries throughout one response. Its
+ * own UI treats those as private work state rather than one visible "Thought"
+ * row per summary, so remove them from the transcript and keep the useful
+ * narration/tool timeline in one collapsible work section. Once the response
+ * is complete, the last text block is the final answer and stays outside the
+ * section so collapsing activity never hides the result.
+ */
+export function splitCodexActivityParts(
+  parts: AdaptedContentPart[],
+  isResponseComplete: boolean
+): CodexActivityParts {
+  const visible = parts.filter((part) => part.type !== "reasoning")
+  if (visible.length === 0) return { activity: [], answer: [] }
+
+  if (!isResponseComplete) {
+    return { activity: visible, answer: [] }
+  }
+
+  let finalTextIndex = -1
+  for (let i = visible.length - 1; i >= 0; i -= 1) {
+    const part = visible[i]
+    if (part.type === "text" && part.text.trim().length > 0) {
+      finalTextIndex = i
+      break
+    }
+  }
+
+  if (finalTextIndex <= 0) {
+    const hasWork =
+      finalTextIndex < 0 && visible.some((part) => part.type !== "text")
+    return hasWork
+      ? { activity: visible, answer: [] }
+      : { activity: [], answer: visible }
+  }
+
+  const activity = visible.slice(0, finalTextIndex)
+  const hasWorkSignal =
+    parts.some((part) => part.type === "reasoning") ||
+    activity.some((part) => part.type !== "text")
+
+  return hasWorkSignal
+    ? { activity, answer: visible.slice(finalTextIndex) }
+    : { activity: [], answer: visible }
+}
+
+const CodexActivitySection = memo(function CodexActivitySection({
+  durationMs,
+  isResponseComplete,
+  children,
+}: {
+  durationMs?: number | null
+  isResponseComplete: boolean
+  children: ReactNode
+}) {
+  const t = useTranslations("Folder.chat.messageList")
+  const tLive = useTranslations("Folder.chat.liveTurnStats")
+  const [open, setOpen] = useState(true)
+  const hasDuration = typeof durationMs === "number" && durationMs > 0
+  const label =
+    isResponseComplete && hasDuration
+      ? t("workedFor", {
+          duration: formatElapsedLabel(durationMs, tLive),
+        })
+      : t("working")
+
+  return (
+    <Collapsible open={open} onOpenChange={setOpen} className="w-full">
+      <CollapsibleTrigger className="group flex w-full items-center gap-1.5 py-0.5 text-sm text-muted-foreground transition-colors hover:text-foreground">
+        <span>{label}</span>
+        <ChevronRightIcon
+          aria-hidden="true"
+          className={cn(
+            "size-3.5 shrink-0 opacity-60 transition-transform",
+            open && "rotate-90"
+          )}
+        />
+        <span aria-hidden="true" className="h-px min-w-6 flex-1 bg-border" />
+      </CollapsibleTrigger>
+      <CollapsibleContent className="mt-3 outline-none data-[state=closed]:animate-out data-[state=open]:animate-in data-[state=closed]:fade-out-0 data-[state=open]:fade-in-0 data-[state=closed]:slide-out-to-top-1 data-[state=open]:slide-in-from-top-1">
+        {children}
+      </CollapsibleContent>
+    </Collapsible>
+  )
+})
+
 // ── Main renderer ─────────────────────────────────────────────────────
 
 interface ContentPartsRendererProps {
   parts: AdaptedContentPart[]
   role?: MessageRole
+  agentType?: AgentType
+  durationMs?: number | null
+  isResponseComplete?: boolean
 }
 
 export const ContentPartsRenderer = memo(function ContentPartsRenderer({
   parts,
   role,
+  agentType,
+  durationMs,
+  isResponseComplete = true,
 }: ContentPartsRendererProps) {
+  const compactCodex = role === "assistant" && agentType === "codex"
+
   const renderPart = (part: AdaptedContentPart, keyId: string): ReactNode => {
     if (part.type === "text") {
       return (
@@ -2738,7 +2848,9 @@ export const ContentPartsRenderer = memo(function ContentPartsRenderer({
     }
 
     if (part.type === "tool-group") {
-      return <ToolGroupPart key={`tg-${keyId}`} part={part} />
+      return (
+        <ToolGroupPart key={`tg-${keyId}`} part={part} compact={compactCodex} />
+      )
     }
 
     if (part.type === "goal-run") {
@@ -2768,6 +2880,7 @@ export const ContentPartsRenderer = memo(function ContentPartsRenderer({
     }
 
     if (part.type === "reasoning") {
+      if (compactCodex) return null
       return <ReasoningPart key={`reasoning-${keyId}`} part={part} />
     }
 
@@ -2791,6 +2904,32 @@ export const ContentPartsRenderer = memo(function ContentPartsRenderer({
     }
 
     return null
+  }
+
+  const renderParts = (nextParts: AdaptedContentPart[], compact: boolean) => (
+    <div className={compact ? "space-y-2.5" : "space-y-4"}>
+      {nextParts.map((part, i) => renderPart(part, `${i}`))}
+    </div>
+  )
+
+  if (compactCodex) {
+    const { activity, answer } = splitCodexActivityParts(
+      parts,
+      isResponseComplete
+    )
+    return (
+      <div className="space-y-4">
+        {activity.length > 0 && (
+          <CodexActivitySection
+            durationMs={durationMs}
+            isResponseComplete={isResponseComplete}
+          >
+            {renderParts(activity, true)}
+          </CodexActivitySection>
+        )}
+        {answer.length > 0 && renderParts(answer, false)}
+      </div>
+    )
   }
 
   return (
