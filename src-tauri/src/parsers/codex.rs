@@ -872,6 +872,14 @@ impl CodexParser {
         // BEFORE the goal — there the flag stays false and nothing is synthesized.
         let mut goal_opens_session = false;
         let mut last_turn_context_ts: Option<DateTime<Utc>> = None;
+        // `token_count` is emitted after many model/tool phases within one
+        // Codex task. Its timestamp yields a CUMULATIVE span from the same
+        // `turn_context`, not a per-message duration. Keep only the latest
+        // cumulative value and attach one duration to the task's final
+        // assistant message. `task_complete.duration_ms` supersedes this
+        // fallback when present.
+        let mut current_turn_message_start: Option<usize> = None;
+        let mut pending_turn_duration_ms: Option<u64> = None;
         let mut context_window_used_tokens: Option<u64> = None;
         let mut context_window_max_tokens: Option<u64> = None;
         let mut latest_total_usage: Option<TurnUsage> = None;
@@ -974,6 +982,20 @@ impl CodexParser {
                     }
                 }
                 "turn_context" => {
+                    // An interrupted/older task may omit `task_complete`.
+                    // Finalize its latest token-count fallback before starting
+                    // the next task, after preserving any buffered reasoning as
+                    // the prior task's final assistant message.
+                    flush_pending_reasoning(
+                        &mut messages,
+                        &mut pending_reasoning,
+                        pending_reasoning_ts,
+                    );
+                    attach_codex_turn_duration(
+                        &mut messages,
+                        current_turn_message_start.take(),
+                        pending_turn_duration_ms.take(),
+                    );
                     // A new API turn means any prior agent lifecycle is complete.
                     active_agent_count = 0;
                     if model.is_none() {
@@ -984,6 +1006,7 @@ impl CodexParser {
                             .map(|s| s.to_string());
                     }
                     last_turn_context_ts = parse_codex_timestamp(&value);
+                    current_turn_message_start = Some(messages.len());
                 }
                 "event_msg" => {
                     if let Some(payload) = value.get("payload") {
@@ -1211,6 +1234,27 @@ impl CodexParser {
                                     pending_reasoning_ts = Some(timestamp);
                                 }
                             }
+                            "task_complete" => {
+                                // This is Codex's authoritative wall-clock task
+                                // duration. It includes time spent awaiting
+                                // parallel sub-agents and must be represented
+                                // once — summing the cumulative token-count
+                                // snapshots can inflate an overnight task into
+                                // hundreds of hours.
+                                let authoritative = payload
+                                    .get("duration_ms")
+                                    .and_then(|v| v.as_u64())
+                                    .filter(|duration| *duration > 0);
+                                let duration =
+                                    authoritative.or(pending_turn_duration_ms.take());
+                                pending_turn_duration_ms = None;
+                                attach_codex_turn_duration(
+                                    &mut messages,
+                                    current_turn_message_start.take(),
+                                    duration,
+                                );
+                                last_turn_context_ts = None;
+                            }
                             "image_generation_end" => {
                                 if active_agent_count > 0 {
                                     continue;
@@ -1311,21 +1355,20 @@ impl CodexParser {
                                         }
                                     }
                                 }
-                                // Compute duration from turn_context to token_count
+                                // Track the latest cumulative duration from
+                                // turn_context to token_count. Do NOT attach it
+                                // to each assistant message: these snapshots all
+                                // share one start timestamp and are not additive.
                                 if let (Some(start_ts), Some(end_ts)) =
                                     (last_turn_context_ts, parse_codex_timestamp(&value))
                                 {
                                     let duration = (end_ts - start_ts).num_milliseconds();
                                     if duration > 0 {
-                                        if let Some(last_msg) = messages
-                                            .iter_mut()
-                                            .rev()
-                                            .find(|m| matches!(m.role, MessageRole::Assistant))
-                                        {
-                                            if last_msg.duration_ms.is_none() {
-                                                last_msg.duration_ms = Some(duration as u64);
-                                            }
-                                        }
+                                        let duration = duration as u64;
+                                        pending_turn_duration_ms = Some(
+                                            pending_turn_duration_ms
+                                                .map_or(duration, |current| current.max(duration)),
+                                        );
                                     }
                                 }
                             }
@@ -1790,6 +1833,13 @@ impl CodexParser {
         // (the `agent_reasoning` events were written but the file ended before the
         // grouped `response_item.reasoning` summary) — flush it so it isn't lost.
         flush_pending_reasoning(&mut messages, &mut pending_reasoning, pending_reasoning_ts);
+        // Interrupted/older rollouts may end without `task_complete`; preserve
+        // the latest cumulative token-count span as a single task duration.
+        attach_codex_turn_duration(
+            &mut messages,
+            current_turn_message_start,
+            pending_turn_duration_ms,
+        );
 
         // Fill in subagent tool call stats (and, only as a fallback, the result)
         // on each spawn execution capsule.
@@ -2073,6 +2123,32 @@ fn parse_codex_timestamp(value: &serde_json::Value) -> Option<DateTime<Utc>> {
         .get("timestamp")
         .and_then(|t| t.as_str())
         .and_then(|s| s.parse::<DateTime<Utc>>().ok())
+}
+
+/// Attach one wall-clock duration to the final assistant message emitted for a
+/// Codex task. Duration snapshots inside a task are cumulative, so representing
+/// them on multiple messages would make downstream turn merging over-count.
+fn attach_codex_turn_duration(
+    messages: &mut [UnifiedMessage],
+    message_start: Option<usize>,
+    duration_ms: Option<u64>,
+) {
+    let (Some(message_start), Some(duration_ms)) = (message_start, duration_ms) else {
+        return;
+    };
+    if duration_ms == 0 {
+        return;
+    }
+    let Some(current_turn_messages) = messages.get_mut(message_start..) else {
+        return;
+    };
+    if let Some(last_assistant) = current_turn_messages
+        .iter_mut()
+        .rev()
+        .find(|message| matches!(message.role, MessageRole::Assistant))
+    {
+        last_assistant.duration_ms = Some(duration_ms);
+    }
 }
 
 /// Emit any buffered streaming `agent_reasoning` sections as a single Thinking
@@ -2754,6 +2830,75 @@ mod tests {
         // The naive `timestamp + duration_ms` would produce ~10.00:19.827Z.
         let wrong = "2026-03-01T10:00:19.827Z".parse::<DateTime<Utc>>().unwrap();
         assert_ne!(completed_at, wrong);
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn task_complete_duration_is_attached_once_not_cumulative_snapshots() {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system time ok")
+            .as_nanos();
+        let path: PathBuf =
+            env::temp_dir().join(format!("codeg-codex-task-duration-{nanos}.jsonl"));
+
+        let content = concat!(
+            "{\"timestamp\":\"2026-03-01T10:00:00Z\",\"type\":\"session_meta\",\"payload\":{\"id\":\"duration-1\",\"cwd\":\"/tmp/demo\"}}\n",
+            "{\"timestamp\":\"2026-03-01T10:00:00Z\",\"type\":\"turn_context\",\"payload\":{\"model\":\"gpt-5-codex\"}}\n",
+            "{\"timestamp\":\"2026-03-01T10:01:00Z\",\"type\":\"event_msg\",\"payload\":{\"type\":\"agent_message\",\"message\":\"checkpoint\"}}\n",
+            "{\"timestamp\":\"2026-03-01T10:01:01Z\",\"type\":\"event_msg\",\"payload\":{\"type\":\"token_count\",\"info\":{\"last_token_usage\":{\"input_tokens\":80,\"cached_input_tokens\":0,\"output_tokens\":20,\"total_tokens\":100}}}}\n",
+            "{\"timestamp\":\"2026-03-01T10:02:00Z\",\"type\":\"event_msg\",\"payload\":{\"type\":\"agent_message\",\"message\":\"done\"}}\n",
+            "{\"timestamp\":\"2026-03-01T10:02:01Z\",\"type\":\"event_msg\",\"payload\":{\"type\":\"token_count\",\"info\":{\"last_token_usage\":{\"input_tokens\":80,\"cached_input_tokens\":0,\"output_tokens\":20,\"total_tokens\":100}}}}\n",
+            "{\"timestamp\":\"2026-03-01T10:02:00.500Z\",\"type\":\"event_msg\",\"payload\":{\"type\":\"task_complete\",\"duration_ms\":120500}}\n"
+        );
+        fs::write(&path, content).expect("write test jsonl");
+
+        let parser = CodexParser::new();
+        let detail = parser
+            .parse_conversation_detail(&path, "duration-1")
+            .expect("parse detail ok");
+        let durations: Vec<u64> = detail
+            .turns
+            .iter()
+            .filter_map(|turn| turn.duration_ms)
+            .collect();
+
+        assert_eq!(durations, vec![120_500]);
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn missing_task_complete_uses_latest_token_count_once() {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system time ok")
+            .as_nanos();
+        let path: PathBuf =
+            env::temp_dir().join(format!("codeg-codex-fallback-duration-{nanos}.jsonl"));
+
+        let content = concat!(
+            "{\"timestamp\":\"2026-03-01T10:00:00Z\",\"type\":\"session_meta\",\"payload\":{\"id\":\"duration-fallback-1\",\"cwd\":\"/tmp/demo\"}}\n",
+            "{\"timestamp\":\"2026-03-01T10:00:00Z\",\"type\":\"turn_context\",\"payload\":{\"model\":\"gpt-5-codex\"}}\n",
+            "{\"timestamp\":\"2026-03-01T10:01:00Z\",\"type\":\"event_msg\",\"payload\":{\"type\":\"agent_message\",\"message\":\"checkpoint\"}}\n",
+            "{\"timestamp\":\"2026-03-01T10:01:01Z\",\"type\":\"event_msg\",\"payload\":{\"type\":\"token_count\",\"info\":null}}\n",
+            "{\"timestamp\":\"2026-03-01T10:02:00Z\",\"type\":\"event_msg\",\"payload\":{\"type\":\"agent_message\",\"message\":\"interrupted after this\"}}\n",
+            "{\"timestamp\":\"2026-03-01T10:02:01Z\",\"type\":\"event_msg\",\"payload\":{\"type\":\"token_count\",\"info\":null}}\n"
+        );
+        fs::write(&path, content).expect("write test jsonl");
+
+        let parser = CodexParser::new();
+        let detail = parser
+            .parse_conversation_detail(&path, "duration-fallback-1")
+            .expect("parse detail ok");
+        let durations: Vec<u64> = detail
+            .turns
+            .iter()
+            .filter_map(|turn| turn.duration_ms)
+            .collect();
+
+        assert_eq!(durations, vec![121_000]);
 
         let _ = fs::remove_file(path);
     }
