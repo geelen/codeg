@@ -183,7 +183,7 @@ export class RemoteDesktopTransport implements Transport {
       // UI in just the calling window (the rest stay live until they
       // themselves hit a 401 — per design we don't broadcast).
       if (isAuthenticationFailed(err)) {
-        this.config.onUnauthorized?.()
+        this.config.onConnectionStateChange?.("unauthorized")
       }
       throw err
     }
@@ -223,6 +223,19 @@ export class RemoteDesktopTransport implements Transport {
     return () => {
       this.reconnectCallbacks.delete(callback)
     }
+  }
+
+  /** Skip the Rust proxy's current reconnect delay/connect attempt. */
+  reconnectNow(): void {
+    if (this.destroyed) return
+    void invoke("remote_ws_reconnect_now", {
+      connectionId: this.config.id,
+    }).catch((err) => {
+      console.warn(
+        "[RemoteDesktopTransport] remote_ws_reconnect_now failed:",
+        err
+      )
+    })
   }
 
   eventStream(): EventStream {
@@ -350,6 +363,7 @@ export class RemoteDesktopTransport implements Transport {
 
     if (channel === WS_READY_CHANNEL) {
       this.wsOpen = true
+      this.config.onConnectionStateChange?.("connected")
       this.readyResolve()
       // Notify EventStream so it can re-issue attach frames for any
       // active subscriptions. Fires on initial connect AND every reconnect.
@@ -382,15 +396,16 @@ export class RemoteDesktopTransport implements Transport {
     }
     if (channel === WS_DISCONNECTED_CHANNEL) {
       this.wsOpen = false
+      this.config.onConnectionStateChange?.("reconnecting")
       // New subscribers (and any concurrent subscribe() calls in flight)
       // must wait for the next `__ready__` before resolving.
       this.resetReady()
       return
     }
     if (channel === WS_UNAUTHORIZED_CHANNEL) {
-      // Rust gave up after WS_RECONNECT_FAIL_THRESHOLD failures, OR the
-      // remote rejected the handshake. Either way, surface as expired.
-      this.config.onUnauthorized?.()
+      // Rust only emits this after an explicit HTTP 401 handshake rejection;
+      // transient network failures remain in the reconnect loop indefinitely.
+      this.config.onConnectionStateChange?.("unauthorized")
       return
     }
     const handlers = this.handlers.get(channel)

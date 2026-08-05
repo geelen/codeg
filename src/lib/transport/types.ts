@@ -2,13 +2,18 @@ import type { EventEnvelope, LiveSessionSnapshot } from "@/lib/types"
 
 export type UnsubscribeFn = () => void
 
+export type RemoteConnectionState =
+  | "connected"
+  | "reconnecting"
+  | "unauthorized"
+
 export interface RemoteTransportConfig {
   id: number
   name: string
   baseUrl: string
   token: string
   windowInstanceId: string
-  onUnauthorized?: () => void
+  onConnectionStateChange?: (state: RemoteConnectionState) => void
 }
 
 /**
@@ -140,6 +145,9 @@ export interface Transport {
    * transports leave this undefined (no disconnect window to guard).
    */
   waitForReady?(): Promise<void>
+
+  /** Skip any pending transport backoff and reconnect immediately. */
+  reconnectNow?(): void
 
   /**
    * Per-connection event stream (Subscribe-with-Snapshot). Returns

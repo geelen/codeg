@@ -83,10 +83,6 @@ const HTTP_TIMEOUT: Duration = Duration::from_secs(30);
 /// longest today is 70s for `describeAgentOptions`).
 const HTTP_TIMEOUT_MAX: Duration = Duration::from_secs(600);
 
-/// Number of consecutive WS connect failures before we give up and emit
-/// `__unauthorized__`. Matches the JS-side `wsFailCount >= 3` threshold.
-const WS_RECONNECT_FAIL_THRESHOLD: u32 = 3;
-
 /// Exponential backoff bounds for WS reconnect. 1s/2s/4s/8s/16s/32s.
 const WS_BACKOFF_INITIAL_SECS: u64 = 1;
 const WS_BACKOFF_MAX_SECS: u64 = 32;
@@ -129,6 +125,10 @@ struct WsTaskEntry {
     /// attach frames on every `__ready__` so a transient WS gap is recovered
     /// automatically.
     outbound_tx: mpsc::Sender<String>,
+    /// Best-effort nudge used by the desktop "Reconnect now" button. A
+    /// capacity-one channel deliberately coalesces repeated clicks: one queued
+    /// wake-up is enough to interrupt the current backoff/connect attempt.
+    reconnect_tx: mpsc::Sender<()>,
 }
 
 #[derive(Clone)]
@@ -1472,6 +1472,7 @@ pub async fn remote_ws_subscribe(
 
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
     let (outbound_tx, outbound_rx) = mpsc::channel::<String>(OUTBOUND_CAPACITY);
+    let (reconnect_tx, reconnect_rx) = mpsc::channel::<()>(1);
     let entry = Arc::new(WsTaskEntry {
         subscribers: Mutex::new({
             let mut map = HashMap::new();
@@ -1481,6 +1482,7 @@ pub async fn remote_ws_subscribe(
         ready: RwLock::new(false),
         shutdown_tx,
         outbound_tx,
+        reconnect_tx,
     });
 
     // Insert under the proxy lock. If a concurrent subscribe raced us, fold
@@ -1518,6 +1520,7 @@ pub async fn remote_ws_subscribe(
             task_entry,
             shutdown_rx,
             outbound_rx,
+            reconnect_rx,
         )
         .await;
     });
@@ -1600,6 +1603,32 @@ pub async fn remote_ws_unsubscribe(
     Ok(())
 }
 
+/// Interrupt the current reconnect delay (or in-flight connection attempt) for
+/// a remote workspace. Repeated clicks are coalesced by the capacity-one
+/// channel, so this remains cheap and idempotent from the UI's perspective.
+#[tauri::command]
+pub async fn remote_ws_reconnect_now(
+    proxy: State<'_, Arc<RemoteProxyState>>,
+    connection_id: i32,
+) -> Result<(), AppCommandError> {
+    let entry = {
+        let tasks = proxy.tasks.lock().await;
+        tasks.get(&connection_id).cloned()
+    }
+    .ok_or_else(|| {
+        AppCommandError::network(format!(
+            "remote ws task not active for connection {connection_id}"
+        ))
+    })?;
+
+    match entry.reconnect_tx.try_send(()) {
+        Ok(()) | Err(mpsc::error::TrySendError::Full(_)) => Ok(()),
+        Err(mpsc::error::TrySendError::Closed(_)) => Err(AppCommandError::network(format!(
+            "remote ws reconnect channel closed for connection {connection_id}"
+        ))),
+    }
+}
+
 // ─── WS background task ───────────────────────────────────────────────
 
 /// Long-running task that maintains one WebSocket per `connection_id`.
@@ -1610,9 +1639,11 @@ pub async fn remote_ws_unsubscribe(
 ///      envelopes.
 ///   4. On disconnect, emit `__disconnected__`, increment fail count, back
 ///      off, retry.
-///   5. After `WS_RECONNECT_FAIL_THRESHOLD` consecutive failures, emit
-///      `__unauthorized__` and exit.
-///   6. At any point, a `shutdown_tx.send(true)` causes graceful exit.
+///   5. Retry transient failures forever. Only an explicit HTTP 401 emits
+///      `__unauthorized__` and exits; ordinary network loss must never be
+///      mislabeled as token expiry.
+///   6. A manual reconnect signal skips the current backoff/connect attempt.
+///   7. At any point, a `shutdown_tx.send(true)` causes graceful exit.
 ///
 /// On exit (any path), the task removes its entry from `proxy.tasks` —
 /// but only if the entry still matches its own `Arc`, so a racy
@@ -1631,6 +1662,7 @@ async fn run_ws_task(
     entry: Arc<WsTaskEntry>,
     mut shutdown_rx: watch::Receiver<bool>,
     mut outbound_rx: mpsc::Receiver<String>,
+    mut reconnect_rx: mpsc::Receiver<()>,
 ) {
     let event_name = format!("remote-ws-event-{connection_id}");
     let ws_url = http_url_to_ws_url(&base_url);
@@ -1649,19 +1681,22 @@ async fn run_ws_task(
                 }
                 continue;
             }
+            _ = reconnect_rx.recv() => continue,
             res = connect_with_subprotocol_auth(&ws_url, &token) => res,
         };
 
         let mut socket = match connect_result {
             Ok(s) => s,
             Err(err) => {
-                tracing::error!("[RemoteProxy] WS connect failed for connection {connection_id}: {err}");
-                fail_count += 1;
-                if fail_count >= WS_RECONNECT_FAIL_THRESHOLD {
+                tracing::error!(
+                    "[RemoteProxy] WS connect failed for connection {connection_id}: {err}"
+                );
+                if err.is_unauthorized() {
                     emit_internal(&app, &entry, &event_name, WS_UNAUTHORIZED_CHANNEL).await;
                     break;
                 }
-                if backoff_sleep(&mut shutdown_rx, fail_count).await {
+                fail_count = fail_count.saturating_add(1);
+                if backoff_sleep(&mut shutdown_rx, &mut reconnect_rx, fail_count).await {
                     break;
                 }
                 continue;
@@ -1731,12 +1766,8 @@ async fn run_ws_task(
         // Disconnected (not via shutdown). Notify and try again.
         *entry.ready.write().await = false;
         emit_internal(&app, &entry, &event_name, WS_DISCONNECTED_CHANNEL).await;
-        fail_count += 1;
-        if fail_count >= WS_RECONNECT_FAIL_THRESHOLD {
-            emit_internal(&app, &entry, &event_name, WS_UNAUTHORIZED_CHANNEL).await;
-            break;
-        }
-        if backoff_sleep(&mut shutdown_rx, fail_count).await {
+        fail_count = fail_count.saturating_add(1);
+        if backoff_sleep(&mut shutdown_rx, &mut reconnect_rx, fail_count).await {
             break;
         }
     }
@@ -1759,12 +1790,17 @@ async fn run_ws_task(
 /// `fail_count` (1s, 2s, 4s, … capped at `WS_BACKOFF_MAX_SECS`). Returns
 /// `true` if shutdown was requested during the wait — caller should exit
 /// its loop in that case.
-async fn backoff_sleep(shutdown_rx: &mut watch::Receiver<bool>, fail_count: u32) -> bool {
+async fn backoff_sleep(
+    shutdown_rx: &mut watch::Receiver<bool>,
+    reconnect_rx: &mut mpsc::Receiver<()>,
+    fail_count: u32,
+) -> bool {
     let shift = fail_count.saturating_sub(1).min(8) as u64;
     let secs = (WS_BACKOFF_INITIAL_SECS << shift).min(WS_BACKOFF_MAX_SECS);
     tokio::select! {
         biased;
         changed = shutdown_rx.changed() => changed.is_ok() && *shutdown_rx.borrow(),
+        _ = reconnect_rx.recv() => false,
         _ = tokio::time::sleep(Duration::from_secs(secs)) => false,
     }
 }
@@ -1839,6 +1875,27 @@ async fn snapshot_subscribers(entry: &Arc<WsTaskEntry>) -> Vec<String> {
 
 // ─── Helpers ──────────────────────────────────────────────────────────
 
+#[derive(Debug)]
+enum WsConnectError {
+    Unauthorized,
+    Transient(String),
+}
+
+impl WsConnectError {
+    fn is_unauthorized(&self) -> bool {
+        matches!(self, Self::Unauthorized)
+    }
+}
+
+impl std::fmt::Display for WsConnectError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Unauthorized => f.write_str("remote server rejected the access token (HTTP 401)"),
+            Self::Transient(detail) => f.write_str(detail),
+        }
+    }
+}
+
 /// Connect to the remote WebSocket with subprotocol-based token auth.
 /// The remote server's auth middleware (see `web/auth.rs`) accepts either
 /// `Authorization: Bearer …` or a subprotocol entry shaped
@@ -1851,23 +1908,31 @@ async fn connect_with_subprotocol_auth(
     token: &str,
 ) -> Result<
     tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>,
-    String,
+    WsConnectError,
 > {
     let mut request: Request = ws_url
         .into_client_request()
-        .map_err(|e| format!("invalid WS URL: {e}"))?;
+        .map_err(|e| WsConnectError::Transient(format!("invalid WS URL: {e}")))?;
 
     let encoded_token = URL_SAFE_NO_PAD.encode(token.trim().as_bytes());
     let protocols_value = format!("{WS_EVENT_PROTOCOL}, {WS_TOKEN_PROTOCOL_PREFIX}{encoded_token}");
     request.headers_mut().insert(
         "sec-websocket-protocol",
         HeaderValue::from_str(&protocols_value)
-            .map_err(|e| format!("invalid subprotocol value: {e}"))?,
+            .map_err(|e| WsConnectError::Transient(format!("invalid subprotocol value: {e}")))?,
     );
 
-    let (stream, _resp) = tokio_tungstenite::connect_async(request)
-        .await
-        .map_err(|e| format!("connect_async: {e}"))?;
+    let (stream, _resp) =
+        tokio_tungstenite::connect_async(request)
+            .await
+            .map_err(|e| match &e {
+                tokio_tungstenite::tungstenite::Error::Http(response)
+                    if response.status().as_u16() == 401 =>
+                {
+                    WsConnectError::Unauthorized
+                }
+                _ => WsConnectError::Transient(format!("connect_async: {e}")),
+            })?;
     Ok(stream)
 }
 
@@ -1899,11 +1964,13 @@ mod tests {
     fn test_entry(subscribers: HashMap<String, WsSubscriber>) -> Arc<WsTaskEntry> {
         let (shutdown_tx, _shutdown_rx) = watch::channel(false);
         let (outbound_tx, _outbound_rx) = mpsc::channel::<String>(8);
+        let (reconnect_tx, _reconnect_rx) = mpsc::channel::<()>(1);
         Arc::new(WsTaskEntry {
             subscribers: Mutex::new(subscribers),
             ready: RwLock::new(false),
             shutdown_tx,
             outbound_tx,
+            reconnect_tx,
         })
     }
 
@@ -1930,6 +1997,25 @@ mod tests {
             http_url_to_ws_url("ftp://example.com"),
             "ftp://example.com/ws/events"
         );
+    }
+
+    #[test]
+    fn only_an_explicit_unauthorized_connect_error_expires_the_connection() {
+        assert!(WsConnectError::Unauthorized.is_unauthorized());
+        assert!(!WsConnectError::Transient("server offline".to_string()).is_unauthorized());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn manual_reconnect_signal_skips_the_backoff_delay() {
+        let (_shutdown_tx, mut shutdown_rx) = watch::channel(false);
+        let (reconnect_tx, mut reconnect_rx) = mpsc::channel::<()>(1);
+        reconnect_tx.try_send(()).unwrap();
+        let started = tokio::time::Instant::now();
+
+        let shutdown = backoff_sleep(&mut shutdown_rx, &mut reconnect_rx, 9).await;
+
+        assert!(!shutdown);
+        assert_eq!(tokio::time::Instant::now(), started);
     }
 
     #[test]
@@ -2023,6 +2109,7 @@ mod tests {
         let proxy = Arc::new(RemoteProxyState::new());
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
         let (outbound_tx, _outbound_rx) = mpsc::channel::<String>(8);
+        let (reconnect_tx, _reconnect_rx) = mpsc::channel::<()>(1);
         let entry = Arc::new(WsTaskEntry {
             subscribers: Mutex::new(HashMap::from([(
                 "sub".to_string(),
@@ -2031,6 +2118,7 @@ mod tests {
             ready: RwLock::new(false),
             shutdown_tx,
             outbound_tx,
+            reconnect_tx,
         });
         proxy.tasks.lock().await.insert(1, entry);
 
@@ -2060,11 +2148,13 @@ mod tests {
     fn entry_with_outbound(capacity: usize) -> (Arc<WsTaskEntry>, mpsc::Receiver<String>) {
         let (shutdown_tx, _shutdown_rx) = watch::channel(false);
         let (outbound_tx, outbound_rx) = mpsc::channel::<String>(capacity);
+        let (reconnect_tx, _reconnect_rx) = mpsc::channel::<()>(1);
         let entry = Arc::new(WsTaskEntry {
             subscribers: Mutex::new(HashMap::new()),
             ready: RwLock::new(false),
             shutdown_tx,
             outbound_tx,
+            reconnect_tx,
         });
         (entry, outbound_rx)
     }

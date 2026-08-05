@@ -9,12 +9,24 @@ import {
   useState,
   type ReactNode,
 } from "react"
-import { Loader2 } from "lucide-react"
+import { Loader2, ShieldAlert } from "lucide-react"
 import { useSearchParams } from "next/navigation"
 import { useTranslations } from "next-intl"
 import {
+  AlertDialog,
+  AlertDialogContent,
+  AlertDialogDescription,
+  AlertDialogFooter,
+  AlertDialogHeader,
+  AlertDialogMedia,
+  AlertDialogTitle,
+} from "@/components/ui/alert-dialog"
+import { Button } from "@/components/ui/button"
+import {
   clearRemoteDesktopTransport,
   configureRemoteDesktopTransport,
+  reconnectRemoteDesktopNow,
+  type RemoteConnectionState,
 } from "@/lib/transport"
 import { resetBackendScopedStores } from "@/stores/backend-scoped-store-reset"
 import { getRemoteWorkspaceConnection } from "@/lib/remote-workspace"
@@ -27,13 +39,15 @@ interface RemoteConnectionContextValue {
   markExpired: () => void
 }
 
-interface RemoteConnectionState {
+interface RemoteConnectionGateState {
   connection: RemoteWorkspaceConnection | null
   loadedId: number | null
   loadedWindowId: string | null
   error: string | null
-  expired: boolean
+  connectionState: RemoteConnectionState
 }
+
+const RECONNECT_DIALOG_GRACE_MS = 4_000
 
 const RemoteConnectionContext =
   createContext<RemoteConnectionContextValue | null>(null)
@@ -72,6 +86,7 @@ export function useResetBackendScopedStoresOnIdentityChange(
 
 export function RemoteConnectionGate({ children }: { children: ReactNode }) {
   const t = useTranslations("RemoteWorkspace")
+  const connectionT = useTranslations("WebConnection")
   const searchParams = useSearchParams()
   const rawId = searchParams.get("remoteConnectionId")
   const remoteConnectionId = rawId ? Number(rawId) : null
@@ -81,12 +96,14 @@ export function RemoteConnectionGate({ children }: { children: ReactNode }) {
   )
   const remoteWindowId =
     searchParams.get("remoteWindowId") || fallbackRemoteWindowId
-  const [state, setState] = useState<RemoteConnectionState>({
+  const [reconnectGeneration, setReconnectGeneration] = useState(0)
+  const [reconnectDialogVisible, setReconnectDialogVisible] = useState(false)
+  const [state, setState] = useState<RemoteConnectionGateState>({
     connection: null,
     loadedId: null,
     loadedWindowId: null,
     error: null,
-    expired: false,
+    connectionState: "connected",
   })
 
   useEffect(() => {
@@ -107,15 +124,18 @@ export function RemoteConnectionGate({ children }: { children: ReactNode }) {
           baseUrl: next.base_url,
           token: next.token,
           windowInstanceId: remoteWindowId,
-          onUnauthorized: () =>
-            setState((prev) => ({ ...prev, expired: true })),
+          onConnectionStateChange: (connectionState) => {
+            if (cancelled) return
+            setReconnectDialogVisible(false)
+            setState((prev) => ({ ...prev, connectionState }))
+          },
         })
         setState({
           connection: next,
           loadedId: remoteConnectionId,
           loadedWindowId: remoteWindowId,
           error: null,
-          expired: false,
+          connectionState: "connected",
         })
       })
       .catch((err) => {
@@ -126,14 +146,14 @@ export function RemoteConnectionGate({ children }: { children: ReactNode }) {
           loadedId: remoteConnectionId,
           loadedWindowId: remoteWindowId,
           error: toErrorMessage(err),
-          expired: false,
+          connectionState: "connected",
         })
       })
 
     return () => {
       cancelled = true
     }
-  }, [remoteConnectionId, remoteWindowId])
+  }, [reconnectGeneration, remoteConnectionId, remoteWindowId])
 
   // ── Backend-identity invariant ─────────────────────────────────────────────
   // A workspace realm's backend identity — (remoteConnectionId, remoteWindowId),
@@ -166,10 +186,14 @@ export function RemoteConnectionGate({ children }: { children: ReactNode }) {
   const value = useMemo(
     () => ({
       connection: state.connection,
-      expired: state.expired,
-      markExpired: () => setState((prev) => ({ ...prev, expired: true })),
+      expired: state.connectionState === "unauthorized",
+      markExpired: () =>
+        setState((prev) => ({
+          ...prev,
+          connectionState: "unauthorized",
+        })),
     }),
-    [state.connection, state.expired]
+    [state.connection, state.connectionState]
   )
 
   const hasRemoteConnection =
@@ -180,10 +204,63 @@ export function RemoteConnectionGate({ children }: { children: ReactNode }) {
   const loading = hasRemoteConnection && !loadedCurrentRemoteWindow
   const error =
     hasRemoteConnection && loadedCurrentRemoteWindow ? state.error : null
-  const expired =
-    hasRemoteConnection && loadedCurrentRemoteWindow ? state.expired : false
+  const connectionState =
+    hasRemoteConnection && loadedCurrentRemoteWindow
+      ? state.connectionState
+      : "connected"
+  const expired = connectionState === "unauthorized"
+  const reconnecting = connectionState === "reconnecting"
   const connection =
     hasRemoteConnection && loadedCurrentRemoteWindow ? state.connection : null
+
+  // Brief sleep/wake and Wi-Fi transitions should recover silently. Only show
+  // the blocking reconnect UI if the outage lasts beyond the same grace period
+  // used by the browser transport.
+  useEffect(() => {
+    if (!reconnecting) return
+    const id = setTimeout(
+      () => setReconnectDialogVisible(true),
+      RECONNECT_DIALOG_GRACE_MS
+    )
+    return () => clearTimeout(id)
+  }, [reconnecting])
+
+  // Wake a sleeping backoff immediately when the machine comes online or the
+  // remote window becomes visible again after laptop sleep.
+  useEffect(() => {
+    const reconnectIfNeeded = () => {
+      if (state.connectionState === "reconnecting") {
+        reconnectRemoteDesktopNow()
+      }
+    }
+    const reconnectWhenVisible = () => {
+      if (document.visibilityState === "visible") reconnectIfNeeded()
+    }
+    window.addEventListener("online", reconnectIfNeeded)
+    document.addEventListener("visibilitychange", reconnectWhenVisible)
+    return () => {
+      window.removeEventListener("online", reconnectIfNeeded)
+      document.removeEventListener("visibilitychange", reconnectWhenVisible)
+    }
+  }, [state.connectionState])
+
+  const handleReconnectNow = () => {
+    if (expired) {
+      // Re-read the saved connection so a token updated in the manager is
+      // picked up without requiring this window to be closed and recreated.
+      setReconnectDialogVisible(false)
+      setState({
+        connection: null,
+        loadedId: null,
+        loadedWindowId: null,
+        error: null,
+        connectionState: "reconnecting",
+      })
+      setReconnectGeneration((value) => value + 1)
+      return
+    }
+    reconnectRemoteDesktopNow()
+  }
 
   if (loading) {
     return (
@@ -202,17 +279,41 @@ export function RemoteConnectionGate({ children }: { children: ReactNode }) {
     )
   }
 
-  if (expired) {
-    return (
-      <div className="flex h-screen items-center justify-center bg-background p-6 text-sm text-destructive">
-        {t("connectionExpired", { name: connection?.name ?? "" })}
-      </div>
-    )
-  }
-
   return (
     <RemoteConnectionContext.Provider value={value}>
       {children}
+      {(expired || reconnectDialogVisible) && (
+        <AlertDialog open onOpenChange={() => {}}>
+          <AlertDialogContent
+            onEscapeKeyDown={(event) => event.preventDefault()}
+          >
+            <AlertDialogHeader>
+              <AlertDialogMedia>
+                {expired ? (
+                  <ShieldAlert className="text-destructive" />
+                ) : (
+                  <Loader2 className="animate-spin" />
+                )}
+              </AlertDialogMedia>
+              <AlertDialogTitle>
+                {expired
+                  ? connectionT("sessionExpiredTitle")
+                  : connectionT("disconnectedTitle")}
+              </AlertDialogTitle>
+              <AlertDialogDescription>
+                {expired
+                  ? t("connectionExpired", { name: connection?.name ?? "" })
+                  : connectionT("reconnectingDescription")}
+              </AlertDialogDescription>
+            </AlertDialogHeader>
+            <AlertDialogFooter>
+              <Button onClick={handleReconnectNow}>
+                {connectionT("reconnectNow")}
+              </Button>
+            </AlertDialogFooter>
+          </AlertDialogContent>
+        </AlertDialog>
+      )}
     </RemoteConnectionContext.Provider>
   )
 }

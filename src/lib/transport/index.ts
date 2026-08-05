@@ -1,7 +1,12 @@
 import { detectEnvironment } from "./detect"
 import type { RemoteTransportConfig, Transport } from "./types"
 
-export type { RemoteTransportConfig, Transport, UnsubscribeFn } from "./types"
+export type {
+  RemoteConnectionState,
+  RemoteTransportConfig,
+  Transport,
+  UnsubscribeFn,
+} from "./types"
 
 let _shellTransport: Transport | null = null
 let _remoteTransport: Transport | null = null
@@ -92,7 +97,12 @@ export function getServerBaseUrl(): string {
 /// a non-remote-desktop window is a no-op so the helper is safe to use
 /// unconditionally from a 401 catch block.
 export function notifyRemoteDesktopUnauthorized(): void {
-  _remoteConfig?.onUnauthorized?.()
+  _remoteConfig?.onConnectionStateChange?.("unauthorized")
+}
+
+/** Interrupt the active remote desktop transport's reconnect backoff. */
+export function reconnectRemoteDesktopNow(): void {
+  _remoteTransport?.reconnectNow?.()
 }
 
 /**
