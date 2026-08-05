@@ -2784,7 +2784,18 @@ const CodexActivitySection = memo(function CodexActivitySection({
 }) {
   const t = useTranslations("Folder.chat.messageList")
   const tLive = useTranslations("Folder.chat.liveTurnStats")
-  const [open, setOpen] = useState(true)
+  const [open, setOpen] = useState(!isResponseComplete)
+  const [wasResponseComplete, setWasResponseComplete] =
+    useState(isResponseComplete)
+
+  // Keep live work visible, then fold it as soon as the response settles.
+  // Synchronize during render so the completed answer and collapsed activity
+  // appear in the same paint. After that transition, only the trigger changes
+  // `open`, so a section the user reopens stays open across later rerenders.
+  if (wasResponseComplete !== isResponseComplete) {
+    setWasResponseComplete(isResponseComplete)
+    setOpen(!isResponseComplete)
+  }
   const hasDuration = typeof durationMs === "number" && durationMs > 0
   const label =
     isResponseComplete && hasDuration

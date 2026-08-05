@@ -26,18 +26,26 @@ function commandGroup(): AdaptedContentPart {
   }
 }
 
-function renderCodex(parts: AdaptedContentPart[]) {
-  return render(
+function codexView(
+  parts: AdaptedContentPart[],
+  isResponseComplete: boolean = true,
+  durationMs: number = 388_386
+) {
+  return (
     <NextIntlClientProvider locale="en" messages={enMessages}>
       <ContentPartsRenderer
         parts={parts}
         role="assistant"
         agentType="codex"
-        durationMs={388_386}
-        isResponseComplete
+        durationMs={durationMs}
+        isResponseComplete={isResponseComplete}
       />
     </NextIntlClientProvider>
   )
+}
+
+function renderCodex(parts: AdaptedContentPart[]) {
+  return render(codexView(parts))
 }
 
 describe("splitCodexActivityParts", () => {
@@ -103,7 +111,7 @@ describe("splitCodexActivityParts", () => {
 })
 
 describe("ContentPartsRenderer Codex activity", () => {
-  it("renders compact collapsible work without Thought rows", async () => {
+  it("renders completed work collapsed without Thought rows", async () => {
     renderCodex([
       {
         type: "text",
@@ -124,19 +132,58 @@ describe("ContentPartsRenderer Codex activity", () => {
     const trigger = screen.getByRole("button", {
       name: "Worked for 6m 28s",
     })
-    expect(trigger).toHaveAttribute("aria-expanded", "true")
-    expect(screen.getByText("Ran 1 command")).toBeInTheDocument()
+    expect(trigger).toHaveAttribute("aria-expanded", "false")
+    expect(screen.queryByText("Ran 1 command")).not.toBeInTheDocument()
     expect(screen.queryByText("Private summary")).not.toBeInTheDocument()
     expect(screen.queryByText("Thought")).not.toBeInTheDocument()
 
     fireEvent.click(trigger)
     await waitFor(() => {
-      expect(
-        screen.queryByText("Checking the repositories.")
-      ).not.toBeInTheDocument()
+      expect(screen.getByText("Ran 1 command")).toBeInTheDocument()
     })
     expect(
       screen.getByText("The repository audit is complete.")
     ).toBeInTheDocument()
+  })
+
+  it("auto-collapses settled work and preserves a manual reopen", async () => {
+    const liveParts: AdaptedContentPart[] = [
+      {
+        type: "text",
+        text: "Checking the repositories.",
+      },
+      commandGroup(),
+    ]
+    const completedParts: AdaptedContentPart[] = [
+      ...liveParts,
+      {
+        type: "text",
+        text: "The repository audit is complete.",
+      },
+    ]
+    const view = render(codexView(liveParts, false))
+
+    expect(screen.getByRole("button", { name: "Working…" })).toHaveAttribute(
+      "aria-expanded",
+      "true"
+    )
+    expect(screen.getByText("Ran 1 command")).toBeInTheDocument()
+
+    view.rerender(codexView(completedParts, true))
+    const settledTrigger = screen.getByRole("button", {
+      name: "Worked for 6m 28s",
+    })
+    expect(settledTrigger).toHaveAttribute("aria-expanded", "false")
+    expect(screen.queryByText("Ran 1 command")).not.toBeInTheDocument()
+
+    fireEvent.click(settledTrigger)
+    await waitFor(() => {
+      expect(screen.getByText("Ran 1 command")).toBeInTheDocument()
+    })
+
+    view.rerender(codexView(completedParts, true, 400_000))
+    expect(
+      screen.getByRole("button", { name: "Worked for 6m 40s" })
+    ).toHaveAttribute("aria-expanded", "true")
   })
 })
