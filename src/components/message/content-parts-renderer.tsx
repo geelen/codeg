@@ -2987,6 +2987,60 @@ export interface CodexActivityParts {
   answer: AdaptedContentPart[]
 }
 
+function isStreamingToolCall(
+  part: Extract<AdaptedContentPart, { type: "tool-call" }>
+): boolean {
+  return part.state === "input-streaming" || part.state === "input-available"
+}
+
+/**
+ * Collapse only adjacent Codex tool activity with the same displayed kind.
+ *
+ * The adapter groups tool calls before this renderer removes Codex's private
+ * reasoning parts, so a command/reasoning/command sequence otherwise becomes
+ * two visually adjacent "Ran 1 command" rows. Flattening and regrouping here
+ * makes the visible timeline match what the user sees: command runs tally up,
+ * while a search, text update, plan, or dedicated card starts a new run.
+ */
+export function groupAdjacentCodexToolActivity(
+  parts: AdaptedContentPart[]
+): AdaptedContentPart[] {
+  const grouped: AdaptedContentPart[] = []
+
+  for (const part of parts) {
+    if (part.type !== "tool-group") {
+      grouped.push(part)
+      continue
+    }
+
+    for (const item of part.items) {
+      const kind = classifyToolKind(item.toolName)
+      const previous = grouped[grouped.length - 1]
+      const previousKind =
+        previous?.type === "tool-group" && previous.items.length > 0
+          ? classifyToolKind(previous.items[0].toolName)
+          : null
+
+      if (previous?.type === "tool-group" && previousKind === kind) {
+        grouped[grouped.length - 1] = {
+          type: "tool-group",
+          items: [...previous.items, item],
+          isStreaming: previous.isStreaming || isStreamingToolCall(item),
+        }
+        continue
+      }
+
+      grouped.push({
+        type: "tool-group",
+        items: [item],
+        isStreaming: isStreamingToolCall(item),
+      })
+    }
+  }
+
+  return grouped
+}
+
 /**
  * Codex persists many short reasoning summaries throughout one response. Its
  * own UI treats those as private work state rather than one visible "Thought"
@@ -3188,14 +3242,15 @@ export const ContentPartsRenderer = memo(function ContentPartsRenderer({
       parts,
       isResponseComplete
     )
+    const groupedActivity = groupAdjacentCodexToolActivity(activity)
     return (
       <div className="space-y-4">
-        {activity.length > 0 && (
+        {groupedActivity.length > 0 && (
           <CodexActivitySection
             durationMs={durationMs}
             isResponseComplete={isResponseComplete}
           >
-            {renderParts(activity, true)}
+            {renderParts(groupedActivity, true)}
           </CodexActivitySection>
         )}
         {answer.length > 0 && renderParts(answer, false)}
