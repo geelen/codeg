@@ -35,6 +35,7 @@ import {
 } from "@/lib/api"
 import { denormalizeSnapshot } from "@/lib/snapshot-denormalize"
 import { buildDelegationSeedEnvelopes } from "@/lib/delegation-seed"
+import { isConnectionBusy } from "@/lib/connection-teardown"
 import {
   getConversationIdByExternalIdFromStore,
   useConversationRuntimeStore,
@@ -2371,6 +2372,16 @@ export interface AcpActionsValue {
     conversationId?: number
   ): Promise<void>
   disconnect(contextKey: string): Promise<void>
+  /**
+   * Release a connection whose SURFACE went away on its own (a preview tab
+   * replaced by the next single-click in the sidebar) — never a user-intent
+   * teardown. Disconnects viewers and idle owners; a busy owner (prompting
+   * turn, or unresolved background tasks) is left running for the idle sweep,
+   * because `acpDisconnect` kills the agent CLI mid-turn and the agent records
+   * that as an interrupted request. Use `disconnect` when the user asked to
+   * stop.
+   */
+  disconnectIfIdle(contextKey: string): Promise<void>
   disconnectAll(): Promise<void>
   sendPrompt(
     contextKey: string,
@@ -2439,6 +2450,18 @@ export interface AcpActionsValue {
     parentConnectionId: string
     parentToolUseId: string
     agentType: AgentType
+    /**
+     * Backfill the in-flight turn from a session snapshot before routing
+     * live events. Required when attaching MID-TURN, which the desktop
+     * firehose cannot serve on its own: `acp://event` only carries FUTURE
+     * events, so without a snapshot the viewer misses everything the turn
+     * already produced and its status stays `connected` instead of
+     * `prompting` (no streaming affordance, empty live message). Real
+     * delegation children attach at `delegation_started` — before the
+     * child's first event — and leave this off. No effect on web/remote:
+     * the attach protocol always opens with a snapshot.
+     */
+    hydrate?: boolean
   }): void
   /**
    * Tear down a previously-attached delegation child. Releases the
@@ -2588,6 +2611,12 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
   // handlers registered in `attachSubscriptionsRef`.
   const reverseMapRef = useRef(new Map<string, string>())
 
+  // contextKey → diagnostic evidence already surfaced as an alert. The same
+  // error reaches us twice: live on the wire, and again in `last_error` on
+  // every re-attach snapshot. Without this a browser refresh would re-raise
+  // the alert each time.
+  const alertedErrorDetailsRef = useRef(new Map<string, string>())
+
   // contextKey → active EventStream subscription handle. Populated only for
   // connections established via the Subscribe-with-Snapshot attach
   // protocol (web + remote-desktop). Used to (a) detach on disconnect /
@@ -2659,7 +2688,13 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
 
       return {
         kind: "sdk_missing",
-        reason: t("blocked.sdkMissing", { agent: agentLabel }),
+        // Claude Code / Codex install a separate ACP adapter package, not the
+        // vendor CLI — saying "{agent} is not installed" to someone who has
+        // `claude` on their PATH reads as a bug in codeg. Name what's actually
+        // missing instead.
+        reason: agent.is_acp_adapter
+          ? t("blocked.adapterMissing", { agent: agentLabel })
+          : t("blocked.sdkMissing", { agent: agentLabel }),
       }
     },
     [t]
@@ -3499,6 +3534,20 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
                 return t("backendErrors.turnFailedEmpty", {
                   agent: agentLabel,
                 })
+              // The agent did emit something, but the backend couldn't parse
+              // it — points at an agent/protocol version mismatch rather than
+              // at the agent's configuration.
+              case "turn_failed_empty_protocol":
+                return t("backendErrors.turnFailedEmptyProtocol", {
+                  agent: agentLabel,
+                })
+              // Only metadata (plan / mode / usage) arrived. Reported as an
+              // observation, NOT as "this turn was fine" — a real failure can
+              // follow a plan or usage update.
+              case "turn_failed_empty_metadata":
+                return t("backendErrors.turnFailedEmptyMetadata", {
+                  agent: agentLabel,
+                })
               case "grok_model_switch_incompatible_agent":
                 return t("backendErrors.grokModelSwitchIncompatibleAgent", {
                   agent: agentLabel,
@@ -3508,9 +3557,27 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
             }
           })()
 
+          // Backend-supplied diagnostic evidence (agent stderr tail, unparsed
+          // update counts), already redacted and bounded there. The alert's
+          // `detail` slot already carries the localized message, so append
+          // below it — `StatusBarAlerts` renders that slot `whitespace-pre-wrap`.
+          const evidence = e.details?.trim()
+          const alertDetail = evidence
+            ? `${localizedMessage}\n\n${evidence}`
+            : localizedMessage
+
+          // `conn.error` feeds the composer status tooltip — keep it the
+          // one-line localized message, never the multi-line evidence.
           dispatch({ type: "ERROR", contextKey, message: localizedMessage })
-          pushAlertRef.current("error", t("eventErrorTitle"), localizedMessage)
-          // Send OS notification for agent errors
+          pushAlertRef.current("error", t("eventErrorTitle"), alertDetail)
+          // Remember what we surfaced so the snapshot path doesn't repeat it
+          // when this client re-attaches.
+          if (evidence) {
+            alertedErrorDetailsRef.current.set(contextKey, evidence)
+          }
+          // Send OS notification for agent errors. Deliberately message-only:
+          // notification centers persist their payload outside the app, so
+          // agent output must not be forwarded there.
           if (nc) {
             const fn = folderNameRef.current
             const title = fn ? `${fn} - Codeg` : "Codeg"
@@ -3665,6 +3732,43 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
     []
   )
 
+  // Surface diagnostic evidence carried by a snapshot's `last_error`.
+  //
+  // Alerts are live-only, so a client that attached AFTER the error fired
+  // (browser refresh, second tab, cold attach mid-session) would otherwise
+  // never learn why the turn came back empty — the snapshot is its only
+  // channel. Scoped to errors that actually carry evidence, i.e. the inferred
+  // `turn_failed_empty*` family, so attaching to a connection with any older
+  // error doesn't start raising alerts it never used to.
+  //
+  // Same routing rules as the live path: evidence goes to the alert only,
+  // never to `conn.error` (composer tooltip) and never to an OS notification.
+  // Held in a ref, following `pushAlertRef` above: the attach/hydrate
+  // callbacks below are deliberately identity-stable (an empty dep array keeps
+  // a re-render from tearing down and re-establishing live subscriptions), so
+  // they must not close over a `t`-dependent callback directly.
+  const surfaceSnapshotErrorDetails = useCallback(
+    (
+      contextKey: string,
+      patch: import("@/lib/snapshot-denormalize").SnapshotPatch
+    ) => {
+      const evidence = patch.lastErrorDetails?.trim()
+      if (!evidence) return
+      if (alertedErrorDetailsRef.current.get(contextKey) === evidence) return
+      alertedErrorDetailsRef.current.set(contextKey, evidence)
+      pushAlertRef.current(
+        "error",
+        t("eventErrorTitle"),
+        patch.lastError ? `${patch.lastError}\n\n${evidence}` : evidence
+      )
+    },
+    [t]
+  )
+  const surfaceSnapshotErrorDetailsRef = useRef(surfaceSnapshotErrorDetails)
+  useEffect(() => {
+    surfaceSnapshotErrorDetailsRef.current = surfaceSnapshotErrorDetails
+  }, [surfaceSnapshotErrorDetails])
+
   // Open a Subscribe-with-Snapshot stream for `connectionId` and route its
   // frames into the store under `contextKey`. Returns the subscription
   // handle for cleanup, or `null` when the active transport doesn't
@@ -3691,6 +3795,7 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
         onSnapshot: (snapshot) => {
           const patch = denormalizeSnapshot(snapshot)
           dispatch({ type: "HYDRATE_FROM_SNAPSHOT", contextKey, patch })
+          surfaceSnapshotErrorDetailsRef.current(contextKey, patch)
           lastActivityRef.current.set(contextKey, Date.now())
           // Recover delegation bindings the snapshot carries but the transient
           // events don't (the load-bearing fix for the web-only "running shows
@@ -4068,6 +4173,7 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
       }
       if (patch) {
         dispatch({ type: "HYDRATE_FROM_SNAPSHOT", contextKey, patch })
+        surfaceSnapshotErrorDetailsRef.current(contextKey, patch)
         seedDelegationsFromSnapshot(
           patch.connectionId,
           patch.activeDelegations,
@@ -4108,12 +4214,15 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
       }
       connectingKeysRef.current.add(contextKey)
 
+      // Declared outside the try so the catch below can still tell whether this
+      // agent is an ACP adapter when picking its "not installed" wording.
+      let configuredAgent: AcpAgentStatus | null = null
+
       try {
         // Preflight: read agent status and block if the SDK / binary is
         // not installed. The session page must never trigger a download
         // or install — if the agent is not ready, prompt the user to
         // install it from Agent Settings instead.
-        let configuredAgent: AcpAgentStatus | null = null
         try {
           configuredAgent = await acpGetAgentStatus(agentType)
         } catch (error) {
@@ -4322,15 +4431,25 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
           savedPrefs.configValues
         )
 
-        // If disconnect was requested while connect was in flight,
-        // tear down immediately instead of registering the connection.
+        // If disconnect was requested while connect was in flight, tear down
+        // immediately instead of registering the connection — but tear down
+        // ONLY what this connect actually created. The backend dedups by
+        // (agent, cwd, session), so `acpConnect` may have handed back a
+        // connection this client already holds under another contextKey (a
+        // session still running in / behind another tab). Killing that one
+        // would end a turn nobody asked to stop; it stays reachable at its own
+        // key and is reclaimed by the sweeps.
         if (abandonedKeysRef.current.delete(contextKey)) {
-          acpDisconnect(connectionId).catch(() => {})
+          if (!isConnectionOwnedLocally(connectionId)) {
+            acpDisconnect(connectionId).catch(() => {})
+          }
           return
         }
         const pendingRequest = pendingConnectRequestsRef.current.get(contextKey)
         if (pendingRequest && !sameConnectRequest(pendingRequest, request)) {
-          acpDisconnect(connectionId).catch(() => {})
+          if (!isConnectionOwnedLocally(connectionId)) {
+            acpDisconnect(connectionId).catch(() => {})
+          }
           return
         }
 
@@ -4384,6 +4503,7 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
               contextKey,
               patch: snapshotPatch,
             })
+            surfaceSnapshotErrorDetailsRef.current(contextKey, snapshotPatch)
             // Recover delegation bindings from the snapshot here too. On
             // Tauri the firehose also delivers the events (so this is an
             // idempotent no-op), but it keeps RemoteDesktop and the legacy
@@ -4430,7 +4550,9 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
           if (message.includes("is not installed")) {
             pushAlertRef.current(
               "error",
-              t("blocked.sdkMissing", { agent: agentLabel }),
+              configuredAgent?.is_acp_adapter
+                ? t("blocked.adapterMissing", { agent: agentLabel })
+                : t("blocked.sdkMissing", { agent: agentLabel }),
               t("agentsSetupHint"),
               [buildOpenAgentsSettingsAction(agentType)]
             )
@@ -4520,6 +4642,26 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
     [dispatch, teardownAttachSubscription]
   )
 
+  // Lifecycle release for a surface that vanished on its own — currently the
+  // preview tab replaced by the next single-click in the sidebar. `disconnect`
+  // stays unconditional because its other callers express user INTENT (agent
+  // switch, restart-to-apply, an explicit close); this one must not destroy
+  // work nobody asked to stop. Same policy as the unmount cleanup
+  // (`shouldDisconnectOnUnmount`): a busy owner keeps running and the idle
+  // sweep reclaims it once its turn / background work settles — it is no
+  // longer in `openTabKeys`, so nothing else keeps it alive.
+  const disconnectIfIdle = useCallback(
+    async (contextKey: string) => {
+      const conn = storeRef.current.connections.get(contextKey)
+      // Owners only: a viewer's disconnect just detaches (it never
+      // acpDisconnects), and leaving one attached would leak its subscription
+      // — the idle sweep skips viewers.
+      if (conn && !conn.isViewer && isConnectionBusy(conn)) return
+      await disconnect(contextKey)
+    },
+    [disconnect]
+  )
+
   const reapplyConfig = useCallback(
     async (contextKey: string): Promise<boolean> => {
       const conn = storeRef.current.connections.get(contextKey)
@@ -4565,6 +4707,9 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
       pendingUnmappedEventsRef.current.delete(conn.connectionId)
     }
     lastActivityRef.current.clear()
+    // Context keys are reused across backends, so a surviving entry here would
+    // suppress the first snapshot alert of an unrelated session.
+    alertedErrorDetailsRef.current.clear()
     await Promise.all(promises)
     dispatch({ type: "REMOVE_ALL" })
   }, [dispatch, teardownAttachSubscription])
@@ -4735,9 +4880,15 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
       parentConnectionId: string
       parentToolUseId: string
       agentType: AgentType
+      hydrate?: boolean
     }) => {
-      const { connectionId, parentConnectionId, parentToolUseId, agentType } =
-        args
+      const {
+        connectionId,
+        parentConnectionId,
+        parentToolUseId,
+        agentType,
+        hydrate,
+      } = args
       const existing = storeRef.current.connections.get(connectionId)
       if (
         existing &&
@@ -4772,11 +4923,48 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
       // Tauri desktop: the global acp://event listener routes by
       // reverseMap. Register the identity mapping and drain any
       // envelopes that arrived between the child's spawn and now.
-      reverseMapRef.current.set(connectionId, connectionId)
-      const buffered = consumeBufferedEvents(connectionId)
-      for (const env of buffered) {
-        applyMappedEnvelope(connectionId, env)
+      const route = () => {
+        reverseMapRef.current.set(connectionId, connectionId)
+        for (const env of consumeBufferedEvents(connectionId)) {
+          applyMappedEnvelope(connectionId, env)
+        }
       }
+      if (!hydrate) {
+        route()
+        return
+      }
+      // Mid-turn attach: the firehose carries only future events, so backfill
+      // the turn already in flight from a snapshot FIRST, then route (same
+      // order as `connectAsViewer` — anything that lands while the fetch is in
+      // flight stays in the unmapped buffer and is deduped by seq on drain).
+      void (async () => {
+        let patch: import("@/lib/snapshot-denormalize").SnapshotPatch | null =
+          null
+        try {
+          const snapshot = await acpGetSessionSnapshot(connectionId)
+          if (snapshot) patch = denormalizeSnapshot(snapshot)
+        } catch (e) {
+          console.warn(
+            "[acp-context] child snapshot fetch failed for",
+            connectionId,
+            e
+          )
+        }
+        // The viewer may have closed while the snapshot was in flight —
+        // never hydrate or install routing for a detached child.
+        const still = storeRef.current.connections.get(connectionId)
+        if (!still?.isDelegationChild || still.connectionId !== connectionId) {
+          return
+        }
+        if (patch) {
+          dispatch({
+            type: "HYDRATE_FROM_SNAPSHOT",
+            contextKey: connectionId,
+            patch,
+          })
+        }
+        route()
+      })()
     },
     [
       applyMappedEnvelope,
@@ -4803,6 +4991,7 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
     () => ({
       connect,
       disconnect,
+      disconnectIfIdle,
       disconnectAll,
       sendPrompt,
       setMode,
@@ -4825,6 +5014,7 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
     [
       connect,
       disconnect,
+      disconnectIfIdle,
       disconnectAll,
       sendPrompt,
       setMode,

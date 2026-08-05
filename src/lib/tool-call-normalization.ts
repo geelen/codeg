@@ -1,4 +1,10 @@
+import {
+  parseCodexListFilesTitle,
+  parseCodexSearchTitle,
+} from "@/lib/codex-command-action"
+import { CODEX_SCRIPT_TOOL_NAME } from "@/lib/codex-code-mode"
 import { COLLAB_AGENT_TOOL_NAME, isCodexCollabInput } from "@/lib/collab-tool"
+import { WAIT_TOOL_NAME, WRITE_STDIN_TOOL_NAME } from "@/lib/shell-session-tool"
 
 const EXACT_TOOL_NAME_ALIASES: Record<string, string> = {
   shell_command: "bash",
@@ -23,7 +29,6 @@ const EXACT_TOOL_NAME_ALIASES: Record<string, string> = {
   change: "edit",
   "functions.change": "edit",
   changes: "edit",
-  write_stdin: "bash",
   read_file: "read",
   read_text_file: "read",
   readfile: "read",
@@ -63,6 +68,17 @@ const EXACT_TOOL_NAME_ALIASES: Record<string, string> = {
   browser_action: "webfetch",
   use_mcp_tool: "tool",
   // Codex
+  // Code-mode script card (`parsers/codex_code_mode.rs`). MUST be an exact
+  // alias: the freeform `exec(ute)?` matcher below would otherwise collapse it
+  // to "bash" and render the JS source as a shell command.
+  [CODEX_SCRIPT_TOOL_NAME]: CODEX_SCRIPT_TOOL_NAME,
+  // Unified-exec session tools. They keep their own identity (see
+  // `shell-session-tool.ts`) instead of collapsing into "bash": their arguments
+  // carry a session id, not a command, so the Terminal card's title derivation
+  // came up empty and every one of them rendered as a bare "bash" / "wait".
+  // Listed explicitly so no future freeform rule can hijack them.
+  [WAIT_TOOL_NAME]: WAIT_TOOL_NAME,
+  [WRITE_STDIN_TOOL_NAME]: WRITE_STDIN_TOOL_NAME,
   spawn_agent: "agent",
   wait_agent: "task",
   close_agent: "task",
@@ -350,8 +366,8 @@ function inferFromInput(
 }
 
 export function normalizeToolName(toolName: string): string {
-  const trimmed = toolName
-    .trim()
+  const raw = toolName.trim()
+  const trimmed = raw
     .replace(/^[:：'"`“”‘’\s]+/, "")
     .replace(/['"`“”‘’\s]+$/, "")
   if (!trimmed) return "tool"
@@ -361,6 +377,19 @@ export function normalizeToolName(toolName: string): string {
 
   const goalUpdate = parseGoalUpdateTitle(trimmed)
   if (goalUpdate) return goalUpdate.toolName
+
+  // codex-acp command-action tool calls (`createCommandActionEvent`) carry no
+  // tool name and no rawInput — only a human title — so the search / list-files
+  // identity has to be read back out of it. Without this the whole title becomes
+  // the "tool name": no search icon, an "other" tool-group tally, and a body
+  // that dumps the raw `{formatted_output, exit_code}` envelope. The sibling
+  // `Read file '<path>'` shape already resolves via the `^read` freeform rule.
+  //
+  // Matched against `raw`, not `trimmed`: these titles END in the quote that
+  // closes the interpolated query/path (`Search for 'TODO'`), and the trailing-
+  // quote strip above would eat it.
+  if (parseCodexSearchTitle(raw)) return "grep"
+  if (parseCodexListFilesTitle(raw)) return "glob"
 
   const canonical = canonicalizeToolName(trimmed)
   const alias = EXACT_TOOL_NAME_ALIASES[canonical]
@@ -531,6 +560,29 @@ export function inferLiveToolName(params: {
   // heuristic rewrites `memory_recall` to `memory_re`.
   if (metaToolName) return metaToolName.toLowerCase()
 
+  // Grok stamps the authoritative tool name in `_meta["x.ai/tool"].name` while
+  // its `title` MUTATES across the lifecycle. A background-task poll is the
+  // worst case: `get_command_or_subagent_output` → "Get task output: term_…" →
+  // "/bin/bash -lc 'pnpm dev …' (term_b0d)", so the title fallback below named
+  // the same call three different things and finally collapsed it to "bash" —
+  // where the history path (which reads `x.ai/tool.name`) kept the real name.
+  //
+  // Placed AFTER `inferFromInput` so every input-shape classification is
+  // preserved (`search_replace` → "edit" via old_string/new_string,
+  // `run_terminal_command` → "bash" via command, …) and this only decides the
+  // cases where the input shape is silent. See `extractGrokToolName` for the
+  // `use_tool` exclusion.
+  const grokToolName = extractGrokToolName(params.meta)
+  if (grokToolName) return normalizeToolName(grokToolName)
+
+  // codex-acp ≥1.1.8 Plan-mode review gate. The backend seeds this tool call
+  // from the `session/request_permission` (see `is_codex_plan_review`), so it
+  // carries no `rawInput` and its human title is a question ("Implement this
+  // plan?") that the title heuristic below would happily mangle into a tool
+  // name. Resolve the identity from the marker instead — MUST stay above
+  // `byTitle` for that reason.
+  if (codexMarksPlanReview(params.meta)) return "plan_review"
+
   const byTitle = normalizeToolName(params.title ?? "")
   if (byTitle !== "tool") return byTitle
 
@@ -565,6 +617,21 @@ export function claudeCodeMarksSubagent(
   const cc = (meta as Record<string, unknown>).claudeCode
   if (!cc || typeof cc !== "object") return false
   return (cc as Record<string, unknown>).subagent === true
+}
+
+/**
+ * codex-acp ≥1.1.8 (#351) marks the Plan-mode review gate with
+ * `_meta.codex = {kind: "plan_review", planItemId}`. The backend forwards that
+ * `_meta` onto the tool call it seeds from the permission request, which is the
+ * only identity signal the card has (no `rawInput`, and a question for a title).
+ */
+export function codexMarksPlanReview(
+  meta: Record<string, unknown> | null | undefined
+): boolean {
+  if (!meta || typeof meta !== "object") return false
+  const codex = (meta as Record<string, unknown>).codex
+  if (!codex || typeof codex !== "object") return false
+  return (codex as Record<string, unknown>).kind === "plan_review"
 }
 
 /**
@@ -605,4 +672,27 @@ function extractGrokPlanModeToolName(
   if (kind === "enter_plan") return "enter_plan_mode"
   if (kind === "exit_plan") return "exit_plan_mode"
   return null
+}
+
+/**
+ * Grok's authoritative tool name from `_meta["x.ai/tool"].name` — the same
+ * field the history parser stores (`parsers/grok.rs`), and the only identity on
+ * the live wire that does NOT mutate across a call's lifecycle (`title` does).
+ *
+ * `use_tool` — Grok's generic MCP envelope — is excluded: the backend unwraps it
+ * and puts the inner `<server>__<tool>` name in the TITLE
+ * (`connection.rs::unwrap_grok_use_tool`), so the envelope name would send every
+ * MCP call (delegation companions included) to the generic tool card.
+ */
+function extractGrokToolName(
+  meta: Record<string, unknown> | null | undefined
+): string | null {
+  if (!meta || typeof meta !== "object") return null
+  const tool = (meta as Record<string, unknown>)["x.ai/tool"]
+  if (!tool || typeof tool !== "object") return null
+  const name = (tool as Record<string, unknown>).name
+  if (typeof name !== "string") return null
+  const trimmed = name.trim()
+  if (!trimmed || trimmed === "use_tool") return null
+  return trimmed
 }

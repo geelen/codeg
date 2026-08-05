@@ -10,11 +10,13 @@ pub mod pet;
 pub mod quick_message;
 pub mod remote_workspace_connection;
 pub mod system;
+pub mod token_usage;
+pub mod work_task;
 
 pub use agent::AgentType;
 pub use automation::{
-    AutomationConfig, AutomationDraft, AutomationInfo, AutomationRunInfo, AutomationRunStatus,
-    IsolationMode, TriggerKind,
+    AutomationAction, AutomationConfig, AutomationDraft, AutomationInfo, AutomationRunInfo,
+    AutomationRunStatus, IsolationMode, TriggerKind,
 };
 #[allow(unused_imports)]
 pub use chat_channel::{ChannelStatusInfo, ChatChannelInfo, ChatChannelMessageLogInfo};
@@ -34,6 +36,17 @@ pub use message::{
 };
 pub use quick_message::QuickMessageInfo;
 pub use remote_workspace_connection::RemoteWorkspaceConnectionInfo;
+pub use token_usage::{
+    TokenUsageBreakdownItem, TokenUsageBucket, TokenUsageConversationItem, TokenUsageFacets,
+    TokenUsageFilter, TokenUsageFolderFacet, TokenUsageHeatCell, TokenUsagePoint,
+    TokenUsageReport, TokenUsageStreak, TokenUsageSyncProgress, TokenUsageSyncResult,
+    TokenUsageSyncStatus, TokenUsageTotals,
+};
+pub use work_task::{
+    WorkTaskChangedFile, WorkTaskConfig, WorkTaskDraft, WorkTaskEventInfo, WorkTaskFolderSettings,
+    WorkTaskInfo, WorkTaskMergeState, WorkTaskPreflight, WorkTaskStatus,
+    WorkTaskTemplateDraft, WorkTaskTemplateInfo, STAGE_PROMPT_ALL,
+};
 #[cfg(feature = "tauri-runtime")]
 pub use system::SystemRenderingSettings;
 pub use system::{

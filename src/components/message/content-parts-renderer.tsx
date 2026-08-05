@@ -35,6 +35,7 @@ import {
 } from "@/components/ai-elements/tool"
 import { Terminal } from "@/components/ai-elements/terminal"
 import { CodeBlock } from "@/components/ai-elements/code-block"
+import { JsonTreeView } from "@/components/ai-elements/json-tree"
 import { UnifiedDiffPreview } from "@/components/diff/unified-diff-preview"
 import { generateUnifiedDiff } from "@/lib/unified-diff-generator"
 import { FilePathLink } from "@/components/ai-elements/link-safety"
@@ -51,6 +52,21 @@ import {
   isContextCompactionMeta,
 } from "./context-compaction-card"
 import { FeedbackCheckResultCard } from "./feedback-check-result-card"
+import { SearchResultsOutput } from "./search-results-output"
+import { parseCodexCommandEnvelope } from "@/lib/codex-command-action"
+import {
+  CODEX_SCRIPT_TOOL_NAME,
+  parseCodexScriptCard,
+  parseCodexScriptMeta,
+  type CodexScriptCard,
+} from "@/lib/codex-code-mode"
+import {
+  describeStdinChars,
+  extractAnnouncedSessionId,
+  isShellSessionToolName,
+  parseShellSessionInput,
+  WAIT_TOOL_NAME,
+} from "@/lib/shell-session-tool"
 import { COLLAB_AGENT_TOOL_NAME } from "@/lib/collab-tool"
 import { DelegatedSubThread } from "./delegated-sub-thread"
 import { DelegationStatusCard } from "./delegation-status-card"
@@ -79,7 +95,10 @@ import {
   WrenchIcon,
   ChevronRightIcon,
   BrainIcon,
+  CodeIcon,
+  KeyboardIcon,
   MessageCircleQuestionMarkIcon,
+  TimerIcon,
   UsersIcon,
 } from "lucide-react"
 
@@ -847,6 +866,18 @@ function getToolIcon(
     return <FilePlusIcon className={ICON_CLASS} />
   if (name === "bash" || name === "exec_command")
     return <TerminalIcon className={ICON_CLASS} />
+  if (name === CODEX_SCRIPT_TOOL_NAME)
+    return <CodeIcon className={ICON_CLASS} />
+  if (isShellSessionToolName(name)) {
+    // Sending keystrokes reads as input; everything else (including the 99% of
+    // `write_stdin` calls that send nothing) is a poll on a running session.
+    const chars = parseShellSessionInput(input ?? null)?.chars
+    return chars ? (
+      <KeyboardIcon className={ICON_CLASS} />
+    ) : (
+      <TimerIcon className={ICON_CLASS} />
+    )
+  }
   if (name === "apply_patch") return <FilePenLineIcon className={ICON_CLASS} />
   if (name === "glob" || name === "grep")
     return <SearchIcon className={ICON_CLASS} />
@@ -864,7 +895,8 @@ function getToolIcon(
   if (
     name === "enterplanmode" ||
     name === "exitplanmode" ||
-    name === "switch_mode"
+    name === "switch_mode" ||
+    name === "plan_review"
   )
     return <ListTodoIcon className={ICON_CLASS} />
   if (name === "attempt_completion")
@@ -929,6 +961,37 @@ function deriveToolTitle(
     if (name === "notebookedit") return `NotebookEdit ${sp}`
   }
 
+  // Codex code-mode script that could not be decomposed: title from the first
+  // command the parser could read, else a plain "Script" label.
+  if (name === CODEX_SCRIPT_TOOL_NAME) {
+    const card = parseCodexScriptCard(input)
+    if (card?.title) {
+      return ellipsis(simplifyShellCommand(card.title).split("\n")[0], 80)
+    }
+    return "Script"
+  }
+
+  // codex unified-exec session tools: neither carries a command, so the bash
+  // branch below came up empty and the header fell back to the bare tool name
+  // ("wait" / "bash"). Title them by the command whose session they address —
+  // resolved by the history parser, see `shell-session-tool.ts`.
+  if (isShellSessionToolName(name)) {
+    const call = parseShellSessionInput(input)
+    if (call) {
+      if (call.chars) return `Stdin ${describeStdinChars(call.chars)}`
+      const verb =
+        name === WAIT_TOOL_NAME && call.terminate ? "Terminate" : "Wait"
+      if (call.command) {
+        return ellipsis(
+          `${verb} ${simplifyShellCommand(call.command).split("\n")[0]}`,
+          80
+        )
+      }
+      if (call.sessionId) return `${verb} cell ${call.sessionId}`
+    }
+    return null
+  }
+
   // Command tools
   if (name === "bash" || name === "exec_command") {
     const description = getField("description")
@@ -989,14 +1052,20 @@ function deriveToolTitle(
     return ellipsis(simplifyShellCommand(commandLike).split("\n")[0], 80)
   }
 
-  // Search tools
+  // Search tools. The path fallbacks cover pattern-less listings — Cline's
+  // `list_files` and codex's `listFiles` / path-only `search` command actions all
+  // classify as glob/grep but carry a scope path instead of a pattern.
   if (name === "glob") {
     const p = getField("pattern")
     if (p) return `Glob ${p}`
+    const path = getField("path")
+    if (path) return `List files ${ellipsis(path, 50)}`
   }
   if (name === "grep") {
     const p = getField("pattern")
     if (p) return `Grep ${ellipsis(p, 50)}`
+    const path = getField("path")
+    if (path) return `Grep ${ellipsis(path, 50)}`
   }
 
   // Task / agent tools
@@ -1055,11 +1124,12 @@ function deriveToolTitle(
     if (sk) return `Skill: ${sk}`
   }
 
-  // EnterPlanMode / ExitPlanMode / SwitchMode
+  // EnterPlanMode / ExitPlanMode / SwitchMode / codex plan_review
   if (
     name === "enterplanmode" ||
     name === "exitplanmode" ||
-    name === "switch_mode"
+    name === "switch_mode" ||
+    name === "plan_review"
   ) {
     const plan = getField("plan")
     if (plan) {
@@ -1121,6 +1191,7 @@ function localizeDerivedToolTitle(
 
   if (title === "Edit") return t("title.edit")
   if (title === "Command") return t("title.command")
+  if (title === "Script") return t("title.script")
   if (title === "TodoWrite") return t("title.todoWrite")
   if (title === "Read") return t("title.read")
   if (title === "Write") return t("title.write")
@@ -1153,9 +1224,34 @@ function localizeDerivedToolTitle(
     })
   }
 
+  // codex session tools. The `cell` forms must be tried first: they are the
+  // fallback shape for an unresolved session id, and `^Wait (.+)$` would eat
+  // them.
+  const waitCell = title.match(/^Wait cell (\d+)$/)
+  if (waitCell) return t("title.waitCell", { id: waitCell[1] })
+
+  const waitCommand = title.match(/^Wait (.+)$/)
+  if (waitCommand) return t("title.waitCommand", { command: waitCommand[1] })
+
+  const terminateCell = title.match(/^Terminate cell (\d+)$/)
+  if (terminateCell) return t("title.terminateCell", { id: terminateCell[1] })
+
+  const terminateCommand = title.match(/^Terminate (.+)$/)
+  if (terminateCommand) {
+    return t("title.terminateCommand", { command: terminateCommand[1] })
+  }
+
+  const stdinChars = title.match(/^Stdin (.+)$/)
+  if (stdinChars) return t("title.stdinChars", { chars: stdinChars[1] })
+
   const globWithPattern = title.match(/^Glob (.+)$/)
   if (globWithPattern) {
     return t("title.globWithPattern", { pattern: globWithPattern[1] })
+  }
+
+  const listFilesWithPath = title.match(/^List files (.+)$/)
+  if (listFilesWithPath) {
+    return t("title.listFilesWithPath", { path: listFilesWithPath[1] })
   }
 
   const grepWithPattern = title.match(/^Grep (.+)$/)
@@ -1318,24 +1414,15 @@ function BashToolInput({ input }: { input: Record<string, unknown> }) {
  * file content renders. Requiring BOTH keys keeps a genuine JSON-file read
  * (`{ output: … }`, `{ stdout: … }`, a lone `{ exit_code: 0 }`, …) from being
  * mistaken for a command envelope. Returns null when it isn't that exact shape.
+ *
+ * Read-only on purpose: the sibling `search` body unwraps the envelope WITHOUT
+ * the CLI-framing strip below, because a search's matched line can legitimately
+ * begin with one of those metadata words (see the `searchOutput` memo).
  */
 export function codexCommandReadOutput(raw: string): string | null {
-  let parsed: unknown
-  try {
-    parsed = JSON.parse(raw)
-  } catch {
-    return null
-  }
-  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed))
-    return null
-  const obj = parsed as Record<string, unknown>
-  if (
-    typeof obj.exit_code !== "number" ||
-    typeof obj.formatted_output !== "string"
-  ) {
-    return null
-  }
-  const out = obj.formatted_output
+  const envelope = parseCodexCommandEnvelope(raw)
+  if (!envelope) return null
+  const out = envelope.output
   // Strip codex's CLI framing ("Chunk ID:/Wall time:/…/Output:\n<content>") only
   // when the output actually STARTS with that metadata — so a clean file whose
   // first line happens to be "Output:" is never truncated by the envelope parser.
@@ -1655,6 +1742,25 @@ function TodoWriteToolInput({ input }: { input: Record<string, unknown> }) {
   return <PlanEntriesList entries={entries} />
 }
 
+/**
+ * Codex code-mode script the history parser could not decompose into real tool
+ * calls — show the JS source it ran instead of pretending it was a shell
+ * command. See `lib/codex-code-mode.ts`.
+ */
+function CodexScriptToolInput({ card }: { card: CodexScriptCard }) {
+  const t = useTranslations("Folder.chat.contentParts")
+  return (
+    <div className="space-y-2">
+      <CodeBlock code={card.source} language="javascript" />
+      {card.callCount > 0 && (
+        <div className="text-xs text-muted-foreground">
+          {t("scriptToolCalls", { count: card.callCount })}
+        </div>
+      )}
+    </div>
+  )
+}
+
 function ApplyPatchToolInput({ input }: { input: string }) {
   return <UnifiedDiffPreview diffText={input} clickableFilePath />
 }
@@ -1672,7 +1778,13 @@ const CODE_FIELDS = new Set([
 ])
 
 /** Fields to hide */
-const HIDDEN_FIELDS = new Set(["dangerouslyDisableSandbox"])
+const HIDDEN_FIELDS = new Set([
+  "dangerouslyDisableSandbox",
+  // Resolved by the history parser purely to title the card
+  // (`shell-session-tool.ts`); repeating it as a parameter row would just
+  // duplicate the header.
+  "session_command",
+])
 
 function GenericToolInput({ input }: { input: string }) {
   const t = useTranslations("Folder.chat.contentParts")
@@ -1728,12 +1840,11 @@ function GenericToolInput({ input }: { input: string }) {
         }
 
         if (value !== null && value !== undefined) {
+          // Nested structured value on a tool with no dedicated card — same
+          // unreadable-JSON-wall problem the result panel had.
           return (
             <FieldBlock key={key} label={label}>
-              <CodeBlock
-                code={JSON.stringify(value, null, 2)}
-                language="json"
-              />
+              <JsonTreeView value={value} />
             </FieldBlock>
           )
         }
@@ -1771,6 +1882,11 @@ function StructuredToolInput({
       {t("inputTruncated")}
     </div>
   ) : null
+
+  if (name === CODEX_SCRIPT_TOOL_NAME) {
+    const card = parseCodexScriptCard(input)
+    if (card) return <CodexScriptToolInput card={card} />
+  }
 
   if (name === "apply_patch") {
     const patchInput =
@@ -2118,9 +2234,18 @@ const ToolCallPart = memo(function ToolCallPart({
     [part.toolName]
   )
   const toolNameLower = normalizedToolName.toLowerCase()
+  // codex's `wait` / `write_stdin` continue a background shell, so they share
+  // the command path: same output envelope to strip, same Terminal body. What
+  // they must NOT share is the `$ <command>` prompt line — the command already
+  // names the card, and reprinting it would read as a re-run (see
+  // `displayCommand` below).
+  const isShellSessionTool = isShellSessionToolName(toolNameLower)
   const isCommandTool =
-    toolNameLower === "bash" || toolNameLower === "exec_command"
+    toolNameLower === "bash" ||
+    toolNameLower === "exec_command" ||
+    isShellSessionTool
   const isCommandLikeTool = isCommandTool || toolNameLower === "apply_patch"
+  const isSearchTool = toolNameLower === "grep" || toolNameLower === "glob"
   const isRunning =
     part.state === "input-available" || part.state === "input-streaming"
   // A `Bash(run_in_background: true)` launch — its result is just the task id +
@@ -2203,14 +2328,63 @@ const ToolCallPart = memo(function ToolCallPart({
     if (sec < 60) return `${sec.toFixed(1)}s`
     return `${(sec / 60).toFixed(1)}m`
   }, [part.output, part.errorText])
+  // The background shell this command left running, when its own script echoed
+  // the id (see `extractAnnouncedSessionId`). One session is polled by any
+  // number of later `wait` cards, and the ones this echo comes with are exactly
+  // the ones the parser could not title by a command — so naming the session
+  // here is what ties those "Wait cell 17983" cards back to the command that
+  // started it.
+  const announcedSessionId = useMemo(
+    () =>
+      toolNameLower === "exec_command"
+        ? extractAnnouncedSessionId(part.output ?? part.errorText)
+        : null,
+    [toolNameLower, part.output, part.errorText]
+  )
+  // One command out of a code-mode script: the row label it was written under,
+  // and whether truncation cost this card its output (see `parseCodexScriptMeta`).
+  const codexScript = useMemo(
+    () => parseCodexScriptMeta(part.meta),
+    [part.meta]
+  )
   const titleSuffix = useMemo(() => {
     const hasStats =
       lineChangeStats &&
       (lineChangeStats.additions > 0 || lineChangeStats.deletions > 0)
-    if (!hasStats && !wallTime && !backgroundLaunch) return null
+    if (
+      !hasStats &&
+      !wallTime &&
+      !backgroundLaunch &&
+      !announcedSessionId &&
+      !codexScript?.label
+    ) {
+      return null
+    }
 
     return (
       <span className="flex items-center gap-1.5 text-xs font-medium">
+        {codexScript?.label && (
+          <span className="rounded-full bg-muted px-1.5 py-0.5 text-[10px] font-medium text-muted-foreground">
+            {codexScript.label}
+          </span>
+        )}
+        {/*
+         * The two notices below the header already say truncation happened, so
+         * only cards without one need telling that the output they DO show was
+         * cut out of a blob codex had trimmed.
+         */}
+        {codexScript?.truncated &&
+          !codexScript.outputMissing &&
+          codexScript.sharedWith.length === 0 && (
+            <span className="text-muted-foreground/60 font-normal">
+              {t("codexScript.truncated")}
+            </span>
+          )}
+        {announcedSessionId && (
+          <span className="text-muted-foreground/60 font-normal">
+            {t("shellSession", { id: announcedSessionId })}
+          </span>
+        )}
         {backgroundLaunch && (
           <span
             className="inline-flex items-center gap-1 rounded-full bg-muted px-1.5 py-0.5 text-[10px] font-medium text-muted-foreground"
@@ -2239,20 +2413,33 @@ const ToolCallPart = memo(function ToolCallPart({
         )}
       </span>
     )
-  }, [lineChangeStats, wallTime, backgroundLaunch, t])
+  }, [
+    lineChangeStats,
+    wallTime,
+    backgroundLaunch,
+    announcedSessionId,
+    codexScript,
+    t,
+  ])
 
   const icon = useMemo(
     () => getToolIcon(normalizedToolName, part.input),
     [normalizedToolName, part.input]
   )
   const displayCommand = useMemo(() => {
-    if (!isCommandTool) return null
+    if (!isCommandTool || isShellSessionTool) return null
     return (
       extractDisplayCommandFromToolInput(part.input) ??
       extractDisplayCommandFromToolInput(part.output) ??
       extractDisplayCommandFromToolInput(part.errorText)
     )
-  }, [isCommandTool, part.input, part.output, part.errorText])
+  }, [
+    isCommandTool,
+    isShellSessionTool,
+    part.input,
+    part.output,
+    part.errorText,
+  ])
   const commandOutput = useMemo(() => {
     if (!isCommandLikeTool) return null
     const source =
@@ -2282,6 +2469,49 @@ const ToolCallPart = memo(function ToolCallPart({
     typeof commandOutput === "string" &&
     typeof liveOutput === "string" &&
     liveOutput.length < commandOutput.length
+  // Search results get a grouped, clickable body instead of the generic result
+  // block. `null` means "not a search tool / nothing to show yet" and falls
+  // through to <ToolOutput>; `""` is a real result — an empty search, rendered
+  // as "no matches".
+  //
+  // Only codex's exact `{formatted_output, exit_code}` envelope is unwrapped
+  // (that is what the generic block was dumping as raw JSON) — every other
+  // agent's search output passes through byte-for-byte, and NOTHING is stripped
+  // from the unwrapped text. codex-acp assigns `formatted_output` straight from
+  // the process's raw `aggregatedOutput`, so it never carries codex's own
+  // "Chunk ID:/Wall time:/Output:" text framing or a Markdown fence — whereas
+  // every cleanup step the command/read paths apply is lossy on a legitimate
+  // search hit. A single-file grep prints matches with no `<path>:` prefix, so
+  // `grep 'Wall time:' server.log`, `grep '^Output:' log`, `grep -h '```' *.md`
+  // and a lone `{"exit_code":0}` all used to come out truncated or empty
+  // ("no matches").
+  const searchOutput = useMemo(() => {
+    if (!isSearchTool) return null
+
+    // codex appears to derive the tool status from the exit code, so an rg/grep
+    // "no matches" (exit 1, no output) can arrive as a FAILED call and land on
+    // the error channel. Recognise exactly that shape as an empty result instead
+    // of a red envelope dump. Scoped to `grep`: exit 1 means "nothing selected"
+    // only for grep-likes — for the list-files commands that classify as `glob`
+    // (ls/find/…) it is a genuine failure, and a successful empty listing
+    // already arrives with exit 0. A real grep failure (exit ≥ 2, or any stderr
+    // text) keeps the error rendering, as does any non-codex error string.
+    if (typeof part.errorText === "string") {
+      if (toolNameLower !== "grep") return null
+      const envelope = parseCodexCommandEnvelope(part.errorText)
+      const noMatches =
+        envelope?.exitCode === 1 && envelope.output.trim().length === 0
+      return noMatches ? "" : null
+    }
+
+    if (typeof part.output !== "string") return null
+    return parseCodexCommandEnvelope(part.output)?.output ?? part.output
+  }, [isSearchTool, toolNameLower, part.output, part.errorText])
+  const searchQuery = useMemo(() => {
+    if (!isSearchTool || !part.input) return null
+    const pattern = tryParseJson(part.input)?.pattern
+    return typeof pattern === "string" && pattern.length > 0 ? pattern : null
+  }, [isSearchTool, part.input])
   const shouldRenderCommandTerminal =
     isCommandTool &&
     (isRunning ||
@@ -2321,6 +2551,7 @@ const ToolCallPart = memo(function ToolCallPart({
       toolNameLower === "switch_mode" ||
       toolNameLower === "enterplanmode" ||
       toolNameLower === "exitplanmode" ||
+      toolNameLower === "plan_review" ||
       isFileTool) &&
     !part.errorText
   // codex-acp #288: the context-compaction lifecycle is a `tool_call` tagged
@@ -2478,19 +2709,22 @@ const ToolCallPart = memo(function ToolCallPart({
     )
   }
 
-  // Plan-mode transition tools (EnterPlanMode/ExitPlanMode/switch_mode): render
-  // the plan directly via a dedicated card instead of folding into a misleading
-  // "思考 N 次" tool-group. `toolNameLower` is the underscore-preserving
-  // `tool-call-normalization` form, so `switch_mode` keeps its underscore here.
+  // Plan-mode transition tools (EnterPlanMode/ExitPlanMode/switch_mode, and
+  // codex's plan_review gate): render the plan directly via a dedicated card
+  // instead of folding into a misleading "思考 N 次" tool-group. `toolNameLower`
+  // is the underscore-preserving `tool-call-normalization` form, so
+  // `switch_mode` / `plan_review` keep their underscore here.
   if (
     toolNameLower === "enterplanmode" ||
     toolNameLower === "exitplanmode" ||
-    toolNameLower === "switch_mode"
+    toolNameLower === "switch_mode" ||
+    toolNameLower === "plan_review"
   ) {
     return (
       <PlanModeCard
         toolName={toolNameLower}
         input={part.input ?? null}
+        output={part.output ?? null}
         errorText={part.errorText ?? null}
         state={part.state}
       />
@@ -2517,6 +2751,25 @@ const ToolCallPart = memo(function ToolCallPart({
             output={part.output}
           />
         )}
+        {/*
+         * Codex truncates a script's combined output by deleting whole lines,
+         * so the label that separated this command's output from the next one
+         * may be gone. Say which commands ended up sharing a card, and which
+         * ones nothing could be attributed to, instead of letting either read
+         * as this command's own result.
+         */}
+        {codexScript?.sharedWith.length ? (
+          <div className="text-[11px] text-muted-foreground">
+            {t("codexScript.sharedWith", {
+              commands: codexScript.sharedWith.join(", "),
+            })}
+          </div>
+        ) : null}
+        {codexScript?.outputMissing && (
+          <div className="text-[11px] text-muted-foreground">
+            {t("codexScript.outputMissing")}
+          </div>
+        )}
         {toolNameLower === "task" && part.output ? (
           <div className="text-sm prose prose-sm dark:prose-invert max-w-none [&_ul]:list-inside [&_ol]:list-inside">
             <MessageResponse>{part.output}</MessageResponse>
@@ -2535,6 +2788,13 @@ const ToolCallPart = memo(function ToolCallPart({
                     {t("showingTailOutput")}
                   </div>
                 )}
+              </div>
+            ) : searchOutput !== null ? (
+              <div className="space-y-2">
+                <h4 className="font-medium text-muted-foreground text-xs uppercase tracking-wide">
+                  {t("result")}
+                </h4>
+                <SearchResultsOutput text={searchOutput} query={searchQuery} />
               </div>
             ) : (
               !shouldHideDuplicateResult &&

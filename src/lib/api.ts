@@ -18,6 +18,13 @@ import type {
   Automation,
   AutomationRun,
   AutomationDraft,
+  WorkTask,
+  WorkTaskChangedFile,
+  WorkTaskConfig,
+  WorkTaskDraft,
+  WorkTaskEvent,
+  WorkTaskFolderSettings,
+  WorkTaskTemplate,
   ConversationSummary,
   ConversationDetail,
   DbConversationDetail,
@@ -54,6 +61,9 @@ import type {
   CustomImportResult,
   FolderHistoryEntry,
   FolderDetail,
+  FolderLinkDetail,
+  FolderLinkPlan,
+  FolderLinkRequestItem,
   CreateChatConversationResult,
   CreateChatDirResult,
   WorktreeResolution,
@@ -126,6 +136,11 @@ import type {
   OfficecliInfo,
   OfficecliSkill,
   SkillSyncReport,
+  TokenUsageFacets,
+  TokenUsageFilter,
+  TokenUsageReport,
+  TokenUsageSyncResult,
+  TokenUsageSyncStatus,
 } from "./types"
 
 export async function listConversations(params?: {
@@ -622,6 +637,14 @@ export async function acpUpdateKimiCodeConfig(params: {
   vertexProject?: string | null
   vertexLocation?: string | null
   rawConfigToml?: string | null
+  /** Declares a thinking capability on the managed model, which is what makes
+   * `kimi acp` advertise its Thinking picker in the composer at all. */
+  reasoningEnabled?: boolean | null
+  /** Declares `always_thinking` instead of `thinking` — no "Off" row. */
+  alwaysThinking?: boolean | null
+  /** The reasoning levels the composer offers; passed to the provider verbatim. */
+  supportEfforts?: string[] | null
+  defaultEffort?: string | null
 }): Promise<number> {
   return getTransport().call("acp_update_kimi_code_config", {
     mode: params.mode,
@@ -634,6 +657,10 @@ export async function acpUpdateKimiCodeConfig(params: {
     vertexProject: params.vertexProject ?? null,
     vertexLocation: params.vertexLocation ?? null,
     rawConfigToml: params.rawConfigToml ?? null,
+    reasoningEnabled: params.reasoningEnabled ?? null,
+    alwaysThinking: params.alwaysThinking ?? null,
+    supportEfforts: params.supportEfforts ?? null,
+    defaultEffort: params.defaultEffort ?? null,
   })
 }
 
@@ -1766,19 +1793,52 @@ export async function gitFetch(
   })
 }
 
-export async function gitPushInfo(path: string): Promise<GitPushInfo> {
-  return getTransport().call("git_push_info", { path })
+/**
+ * Update a branch WITHOUT checking it out. The checked-out branch falls back to
+ * a normal pull (so a conflict can still come back on `conflict`); any other
+ * local branch is fast-forwarded from its upstream, and a remote branch
+ * (`isRemote`, e.g. `origin/main`) only advances its remote-tracking ref.
+ */
+export async function gitUpdateBranch(
+  path: string,
+  branch: string,
+  isRemote: boolean,
+  credentials?: GitCredentials | null
+): Promise<GitPullResult> {
+  return getTransport().call("git_update_branch", {
+    path,
+    branch,
+    isRemote,
+    credentials: credentials ?? null,
+  })
 }
 
+/** `branch` omitted (or null) reports on the checked-out branch. */
+export async function gitPushInfo(
+  path: string,
+  branch?: string | null
+): Promise<GitPushInfo> {
+  return getTransport().call("git_push_info", {
+    path,
+    branch: branch ?? null,
+  })
+}
+
+/**
+ * Push a branch. `branch` omitted (or null) pushes the checked-out one; naming
+ * one pushes it without checking it out (`git push <remote> <branch>`).
+ */
 export async function gitPush(
   path: string,
   remote?: string | null,
   credentials?: GitCredentials | null,
-  folderId?: number | null
+  folderId?: number | null,
+  branch?: string | null
 ): Promise<GitPushResult> {
   return getTransport().call("git_push", {
     path,
     remote: remote ?? null,
+    branch: branch ?? null,
     credentials: credentials ?? null,
     folderId: folderId ?? null,
   })
@@ -1939,19 +1999,27 @@ export async function openStashWindow(folderId: number): Promise<void> {
   window.open(result.path, `stash-${folderId}`)
 }
 
-export async function openPushWindow(folderId: number): Promise<void> {
+/** `branch` preselects the push target; omitted means the checked-out branch. */
+export async function openPushWindow(
+  folderId: number,
+  branch?: string | null
+): Promise<void> {
   const locale = getCurrentEffectiveAppLocale()
   if (isDesktop()) {
     return getShellTransport().call("open_push_window", {
       folderId,
       locale,
       remoteConnectionId: getActiveRemoteConnectionId(),
+      branch: branch ?? null,
     })
   }
   const result = await getTransport().call<{ path: string }>(
     "open_push_window",
-    { folderId, locale }
+    { folderId, locale, branch: branch ?? null }
   )
+  // Reusing the window NAME navigates an already-open push window to the new
+  // URL, so the preselected branch applies there too (the desktop path gets the
+  // same effect from the `push://retarget-branch` event).
   window.open(result.path, `push-${folderId}`)
 }
 
@@ -2131,6 +2199,69 @@ export async function gitAddFiles(
 }
 
 // Window management commands
+
+// ─── Workspace folder links (multi-folder workspace) ───
+
+/** Links currently registered for `folderId`, with their live on-disk status. */
+export async function listFolderLinks(
+  folderId: number
+): Promise<FolderLinkDetail[]> {
+  return getTransport().call("list_folder_links", { folderId })
+}
+
+/**
+ * Dry run: what names the picked directories would get and which ones would be
+ * skipped. Resolved server-side against the real filesystem, so the dialog can
+ * show the final names before anything is created.
+ */
+export async function previewFolderLinks(
+  folderId: number,
+  paths: string[]
+): Promise<FolderLinkPlan[]> {
+  return getTransport().call("preview_folder_links", { folderId, paths })
+}
+
+/**
+ * Create the links. Entries that can't be linked are skipped rather than
+ * failing the batch — the result is what actually landed.
+ */
+export async function createFolderLinks(
+  folderId: number,
+  items: FolderLinkRequestItem[],
+  gitExclude = true
+): Promise<FolderLinkDetail[]> {
+  return getTransport().call("create_folder_links", {
+    folderId,
+    items,
+    gitExclude,
+  })
+}
+
+/** Rename a link (moves the symlink; the target is untouched). */
+export async function renameFolderLink(
+  linkId: number,
+  newName: string
+): Promise<FolderLinkDetail> {
+  return getTransport().call("rename_folder_link", { linkId, newName })
+}
+
+/** Recreate the symlink for a link whose on-disk entry went missing. */
+export async function repairFolderLink(
+  linkId: number
+): Promise<FolderLinkDetail> {
+  return getTransport().call("repair_folder_link", { linkId })
+}
+
+/**
+ * Drop a link. With `deleteLink` the symlink is removed from the workspace
+ * root; the directory it pointed at is never touched.
+ */
+export async function removeFolderLink(
+  linkId: number,
+  deleteLink = true
+): Promise<void> {
+  return getTransport().call("remove_folder_link", { linkId, deleteLink })
+}
 
 export async function openFolder(path: string): Promise<FolderDetail> {
   return getTransport().call("open_folder", { path })
@@ -2513,6 +2644,30 @@ export async function quickMessagesReorder(ids: number[]): Promise<void> {
   return getTransport().call("quick_messages_reorder", { ids })
 }
 
+// Token usage dashboard
+
+export async function tokenUsageReport(
+  filter: TokenUsageFilter
+): Promise<TokenUsageReport> {
+  return getTransport().call("token_usage_report", { filter })
+}
+
+export async function tokenUsageFacets(): Promise<TokenUsageFacets> {
+  return getTransport().call("token_usage_facets")
+}
+
+export async function tokenUsageStatus(): Promise<TokenUsageSyncStatus> {
+  return getTransport().call("token_usage_status")
+}
+
+/** `full` drops every stored fact and re-parses every transcript — the escape
+ *  hatch for a session file the agent's own CLI grew behind codeg's back. */
+export async function tokenUsageSync(
+  mode: "incremental" | "full" = "incremental"
+): Promise<TokenUsageSyncResult> {
+  return getTransport().call("token_usage_sync", { mode })
+}
+
 // Automations
 
 export async function automationList(): Promise<Automation[]> {
@@ -2575,6 +2730,175 @@ export async function automationRunNow(automationId: number): Promise<number> {
 /** Cancel an in-flight (or clear a wedged) run. */
 export async function automationCancelRun(runId: number): Promise<void> {
   return getTransport().call("automation_cancel_run", { runId })
+}
+
+// Work tasks
+
+export async function workTaskList(
+  folderId?: number | null
+): Promise<WorkTask[]> {
+  return getTransport().call("work_task_list", { folderId: folderId ?? null })
+}
+
+export async function workTaskGet(id: number): Promise<WorkTask> {
+  return getTransport().call("work_task_get", { id })
+}
+
+export async function workTaskEvents(
+  taskId: number,
+  limit = 500
+): Promise<WorkTaskEvent[]> {
+  return getTransport().call("work_task_events", { taskId, limit })
+}
+
+export async function workTaskCreate(draft: WorkTaskDraft): Promise<WorkTask> {
+  return getTransport().call("work_task_create", { draft })
+}
+
+export async function workTaskUpdate(
+  id: number,
+  draft: WorkTaskDraft
+): Promise<WorkTask> {
+  return getTransport().call("work_task_update", { id, draft })
+}
+
+/** Persist the pending column's drag order (index → sort_order). */
+export async function workTaskReorder(
+  folderId: number,
+  orderedIds: number[]
+): Promise<void> {
+  return getTransport().call("work_task_reorder", { folderId, orderedIds })
+}
+
+export async function workTaskDelete(
+  id: number,
+  deleteWorktree = false
+): Promise<void> {
+  return getTransport().call("work_task_delete", { id, deleteWorktree })
+}
+
+export async function workTaskStart(id: number): Promise<void> {
+  return getTransport().call("work_task_start", { id })
+}
+
+/** Queue every todo of the folder — or of every folder holding todos when
+ *  `folderId` is null. Returns how many were claimed. */
+export async function workTaskStartAll(
+  folderId: number | null
+): Promise<number> {
+  return getTransport().call("work_task_start_all", { folderId })
+}
+
+export async function workTaskRetry(id: number): Promise<void> {
+  return getTransport().call("work_task_retry", { id })
+}
+
+/** canceled → todo (back onto the board; started again explicitly). */
+export async function workTaskRequeue(id: number): Promise<void> {
+  return getTransport().call("work_task_requeue", { id })
+}
+
+/** Return a reviewed task to the agent with feedback. */
+export async function workTaskReturn(
+  id: number,
+  feedback: string
+): Promise<void> {
+  return getTransport().call("work_task_return", { id, feedback })
+}
+
+export async function workTaskCancel(id: number): Promise<void> {
+  return getTransport().call("work_task_cancel", { id })
+}
+
+/** Dispatch the agent-driven merge (`message: null` = the agent writes the
+ *  commit message itself); the outcome rides `task://changed` events. */
+export async function workTaskMerge(
+  id: number,
+  message: string | null,
+  deleteWorktree: boolean
+): Promise<void> {
+  return getTransport().call("work_task_merge", {
+    id,
+    message,
+    deleteWorktree,
+  })
+}
+
+export async function workTaskArchive(
+  id: number,
+  archived: boolean
+): Promise<void> {
+  return getTransport().call("work_task_archive", { id, archived })
+}
+
+/** Remove the task's worktree + branch (also retries a failed cleanup). */
+export async function workTaskCleanup(id: number): Promise<void> {
+  return getTransport().call("work_task_cleanup", { id })
+}
+
+/** Unified diff of the worktree vs the task's recorded base. */
+export async function workTaskDiff(
+  id: number,
+  file?: string | null
+): Promise<string> {
+  return getTransport().call("work_task_diff", { id, file: file ?? null })
+}
+
+export async function workTaskChangedFiles(
+  id: number
+): Promise<WorkTaskChangedFile[]> {
+  return getTransport().call("work_task_changed_files", { id })
+}
+
+/** Effective settings after the folder → global → built-in fallback — what
+ *  the engine will actually use for this folder. */
+export async function workTaskSettingsEffective(
+  folderId: number
+): Promise<WorkTaskFolderSettings> {
+  return getTransport().call("work_task_settings_effective", { folderId })
+}
+
+export async function workTaskSettingsGet(
+  folderId: number
+): Promise<WorkTaskFolderSettings> {
+  return getTransport().call("work_task_settings_get", { folderId })
+}
+
+/** The folder's own settings row, or null when it follows the global
+ *  defaults — how the settings dialog tells the two apart. */
+export async function workTaskSettingsGetOwn(
+  folderId: number
+): Promise<WorkTaskFolderSettings | null> {
+  return getTransport().call("work_task_settings_get_own", { folderId })
+}
+
+export async function workTaskSettingsSet(
+  folderId: number,
+  settings: WorkTaskFolderSettings
+): Promise<void> {
+  return getTransport().call("work_task_settings_set", { folderId, settings })
+}
+
+/** Drop the folder's own settings row — it reverts to the global defaults. */
+export async function workTaskSettingsDelete(folderId: number): Promise<void> {
+  return getTransport().call("work_task_settings_delete", { folderId })
+}
+
+export async function workTaskTemplateList(): Promise<WorkTaskTemplate[]> {
+  return getTransport().call("work_task_template_list", {})
+}
+
+/** Upsert by exact name: an existing template of the same name is replaced. */
+export async function workTaskTemplateSave(draft: {
+  name: string
+  title: string
+  config: WorkTaskConfig
+}): Promise<WorkTaskTemplate> {
+  return getTransport().call("work_task_template_save", { draft })
+}
+
+export async function workTaskTemplateDelete(id: number): Promise<void> {
+  return getTransport().call("work_task_template_delete", { id })
 }
 
 // Directory browser (for web/server mode)
